@@ -80,6 +80,8 @@ import { ChatDbReader, type InboundMessageReader, type InboundAttachment, type I
 import { ImessageSender } from "./imessage/sender.ts";
 import { ImessageWatcher } from "./imessage/watcher.ts";
 import { NdjsonLogger } from "./log.ts";
+import { openVisibleChrome } from "./browser/open-visible.ts";
+import { openVisibleChrome } from "./browser/open-visible.ts";
 import { seedComputerUsageInsight } from "./insights/computer-usage.ts";
 import { seedHeartbeat } from "./insights/heartbeat.ts";
 import { buildOrientation } from "./persona/orientation.ts";
@@ -546,9 +548,9 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonRu
             throw new Error("Google Chrome is not installed at /Applications; install it or set PUPPETEER_EXECUTABLE_PATH in ~/.openinstinct/env");
           }
           mkdirSync(paths.chromeProfile, { recursive: true });
-          Bun.spawn([chrome, `--user-data-dir=${paths.chromeProfile}`, "--profile-directory=Default", "--no-first-run", "--no-default-browser-check", "--new-window", "about:blank"], { stdout: "ignore", stderr: "ignore" });
-          logger.write("info", "browser", "profile_opened_for_owner", { profile: paths.chromeProfile });
-          return { opened: true, profile: paths.chromeProfile };
+          const result = await openVisibleChrome({ chrome, profile: paths.chromeProfile, logger });
+          logger.write("info", "browser", "profile_opened_for_owner", { profile: paths.chromeProfile, ...result });
+          return { opened: true, profile: paths.chromeProfile, ...result };
         },
       },
       chat: {
