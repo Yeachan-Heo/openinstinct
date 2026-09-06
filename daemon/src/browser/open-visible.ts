@@ -33,6 +33,8 @@ export interface CdpProbe {
   version(): Promise<{ readonly browser: string; readonly webSocketDebuggerUrl: string } | undefined>;
   /** Sends Browser.close; resolves when the socket is gone or the deadline passes. */
   close(webSocketDebuggerUrl: string): Promise<void>;
+  /** Pid of the Chrome main process on the given profile, if any. */
+  pid(profile: string): Promise<number | undefined>;
 }
 
 export interface OpenVisibleChromeResult {
@@ -51,11 +53,11 @@ export async function openVisibleChrome(input: OpenVisibleChromeInput): Promise<
   let replacedHeadless = false;
   if (existing !== undefined) {
     if (!/headless/i.test(existing.browser)) {
-      // A visible instance already holds the profile: a new-window request
-      // reaches it over IPC, so just spawn and activate.
-      const proc = spawn(visibleArgs(input.chrome, input.profile));
-      await sleep(600);
-      const activated = await activate(proc.pid);
+      // A visible instance already holds the profile. Spawning again would
+      // hand `--new-window` to it over IPC and stack windows; bring the one
+      // window it has to the front instead.
+      const pid = await cdp.pid(input.profile);
+      const activated = pid === undefined ? false : await activate(pid);
       return { replacedHeadless: false, reusedVisible: true, activated };
     }
     input.logger.write("info", "browser", "closing_headless_for_owner", { browser: existing.browser });
@@ -118,6 +120,14 @@ const liveCdp: CdpProbe = {
       ws.onerror = () => { clearTimeout(timer); done(); };
       ws.onclose = () => { clearTimeout(timer); resolve(); };
     });
+  },
+  async pid(profile) {
+    // Main process only: helpers carry --type=…; the main one carries the
+    // profile flag without it.
+    const proc = Bun.spawn(["/usr/bin/pgrep", "-f", `Google Chrome --.*--user-data-dir=${profile}(\\s|$)`], { stdout: "pipe", stderr: "ignore" });
+    const out = await new Response(proc.stdout).text();
+    const pids = out.split("\n").map((line) => Number(line.trim())).filter((n) => Number.isInteger(n) && n > 0);
+    return pids[0];
   },
 };
 

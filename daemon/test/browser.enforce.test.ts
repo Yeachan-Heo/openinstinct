@@ -88,10 +88,14 @@ describe("other agents' homes and bot tokens", () => {
 
 describe("per-child tab namespace", () => {
   const app = { browser: "chrome", user_data_dir: "/p", background: true, no_focus: true, cdp_port: 9222 };
+  const own = { ...app, target: "abcd1234-" };
   test("tab names outside the child's prefix are refused, including the implicit default", () => {
-    expect(checkBrowserInput({ app, name: "threads" }, "/p", "abcd1234-")).toContain('start with "abcd1234-"');
-    expect(checkBrowserInput({ app }, "/p", "abcd1234-")).toContain("got \"main\"");
-    expect(checkBrowserInput({ app, name: "abcd1234-threads" }, "/p", "abcd1234-")).toBeUndefined();
+    expect(checkBrowserInput({ app: own, name: "threads" }, "/p", "abcd1234-")).toContain('start with "abcd1234-"');
+    expect(checkBrowserInput({ app: own }, "/p", "abcd1234-")).toContain("got \"main\"");
+    expect(checkBrowserInput({ app: own, name: "abcd1234-threads" }, "/p", "abcd1234-")).toBeUndefined();
+  });
+  test("a child must target its own tab in the shared window", () => {
+    expect(checkBrowserInput({ app, name: "abcd1234-main" }, "/p", "abcd1234-")).toContain('app.target must be "abcd1234-"');
   });
   test("main session has no prefix requirement", () => {
     expect(checkBrowserInput({ app, name: "main" }, "/p")).toBeUndefined();

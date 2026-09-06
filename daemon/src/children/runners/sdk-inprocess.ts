@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { createAgentSession, SessionManager, Settings, type CustomTool } from "@gajae-code/coding-agent";
 import { AgentRegistry } from "@gajae-code/coding-agent/registry/agent-registry";
 import { browserProfileEnforcer } from "../../browser/enforce.ts";
+import { createChildTabRegistry, type ChildTabRegistry } from "../../browser/child-tab.ts";
 import { loadSoul } from "../../persona/soul.ts";
 import type { ChildRunRequest, ChildRunResult, ChildRunner } from "../runner.ts";
 import { CHILD_REPORTING_INSTRUCTION } from "../report-progress-tool.ts";
@@ -131,6 +132,7 @@ export class SdkInProcessRunner implements ChildRunner {
 export class SdkChildSessionFactory implements ChildSessionFactory {
   public readonly agentRegistry = new AgentRegistry();
   private sessionSequence = 0;
+  private readonly tabs: ChildTabRegistry = createChildTabRegistry();
 
   public constructor(private readonly modelPattern: string) {}
 
@@ -167,7 +169,7 @@ export class SdkChildSessionFactory implements ChildSessionFactory {
       ...(input.conversational && input.customTools !== undefined ? { customTools: [...input.customTools] } : {}),
       enableLsp: false,
       // Children get a generous but finite budget: a monitor that needs 40 tool calls is doing something wrong.
-      extensions: [browserProfileEnforcer(join(homedir(), ".openinstinct", "chrome-profile"), { forbiddenRoot: join(homedir(), ".openinstinct"), maxToolCallsPerTurn: 40, tabPrefix })],
+      extensions: [browserProfileEnforcer(join(homedir(), ".openinstinct", "chrome-profile"), { forbiddenRoot: join(homedir(), ".openinstinct"), maxToolCallsPerTurn: 40, tabPrefix, tabs: this.tabs })],
       systemPrompt: (defaults) => {
         const prompt = childSystemPrompt(defaults, input.conversational, tabPrefix);
         promptHash = hashPrompt(prompt);
@@ -180,6 +182,14 @@ export class SdkChildSessionFactory implements ChildSessionFactory {
     if (promptHash !== undefined) {
       childSession.promptHash = promptHash;
     }
+    // The child's tab lives in the owner-visible shared window; close it with
+    // the session so finished tasks do not pile up as blank tabs.
+    const dispose = childSession.dispose?.bind(childSession);
+    const tabs = this.tabs;
+    childSession.dispose = async () => {
+      await tabs.release(tabPrefix).catch(() => false);
+      await dispose?.();
+    };
     return childSession;
   }
 }
@@ -188,7 +198,7 @@ export function childSystemPrompt(defaults: readonly string[], conversational: b
   const chromeProfile = join(homedir(), ".openinstinct", "chrome-profile");
   const browserInstruction = tabPrefix === undefined
     ? `Browser: always pass app: {browser: "chrome", user_data_dir: "${chromeProfile}", background: true, no_focus: true} and reuse the tab named "main"; never use the owner's personal Chrome profile.`
-    : `Browser: always pass app: {browser: "chrome", user_data_dir: "${chromeProfile}", background: true, no_focus: true, cdp_port: 9222}; never use the owner's personal Chrome profile. Other tasks share this browser, so every tab name you use must start with "${tabPrefix}" (e.g. name: "${tabPrefix}main"); close your tabs when you are done.`;
+    : `Browser: always pass app: {browser: "chrome", user_data_dir: "${chromeProfile}", background: true, no_focus: true, cdp_port: 9222, target: "${tabPrefix}"}; never use the owner's personal Chrome profile. Other tasks share this browser window: your tab is the one titled "${tabPrefix}" (app.target selects it), and every tab name you use must start with "${tabPrefix}" (e.g. name: "${tabPrefix}main").`;
   return [
     ...defaults,
     loadSoul().text,

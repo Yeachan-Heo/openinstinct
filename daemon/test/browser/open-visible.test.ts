@@ -19,6 +19,9 @@ function harness(sequence: Array<{ browser: string; webSocketDebuggerUrl: string
     async close(url) {
       calls.push(`close:${url}`);
     },
+    async pid() {
+      return 777;
+    },
   };
   const logger = { write: (_l: "info" | "warn", _m: string, event: string) => { calls.push(event); } };
   return {
@@ -61,13 +64,13 @@ describe("openVisibleChrome", () => {
     expect(h.activated).toEqual([4242]);
   });
 
-  test("visible instance already running: only asks it for a new window and activates", async () => {
+  test("visible instance already running: never spawns (that stacks windows), just brings it to the front", async () => {
     const h = harness([{ browser: "Chrome/152", webSocketDebuggerUrl: "ws://visible" }]);
     const result = await openVisibleChrome(h.input);
     expect(result).toEqual({ replacedHeadless: false, reusedVisible: true, activated: true });
     expect(h.calls).toEqual([]);
-    expect(h.spawned).toHaveLength(1);
-    expect(h.activated).toEqual([4242]);
+    expect(h.spawned).toHaveLength(0);
+    expect(h.activated).toEqual([777]);
   });
 
   test("Chrome never answers after spawn: reports not activated rather than hanging", async () => {
