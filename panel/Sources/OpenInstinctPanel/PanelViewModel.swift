@@ -416,7 +416,7 @@ public final class PanelViewModel: ObservableObject {
         let status: Int32
     }
 
-    private nonisolated static func kickstartDaemon() async throws {
+    nonisolated static func kickstartDaemon() async throws {
         let result = await Task.detached(priority: .userInitiated) {
             PanelViewModel.runLaunchctlKickstart()
         }.value

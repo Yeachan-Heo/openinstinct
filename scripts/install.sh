@@ -83,6 +83,32 @@ model_catalog_valid || {
   printf '%s\n' "installed AI package has no valid model catalog; existing daemon was left untouched" >&2
   exit 1
 }
+# The staged tree must at least parse and start. A checkout with unresolved
+# merge markers, or a missing module, would otherwise be copied into lib/ and
+# only fail on the next restart — leaving the daemon down with the panel
+# saying "restarting". Boot it once in a throwaway HOME and require it to
+# still be alive after a few seconds.
+if grep -rlE '^(<<<<<<<|>>>>>>>) ' "$library_stage/daemon/src" >/dev/null 2>&1; then
+  printf '%s\n' "daemon source has unresolved merge conflict markers; existing daemon was left untouched:" >&2
+  grep -rlE '^(<<<<<<<|>>>>>>>) ' "$library_stage/daemon/src" >&2
+  exit 1
+fi
+smoke_home=$(mktemp -d -t oi-smoke)
+mkdir -p "$smoke_home/.openinstinct/logs" "$smoke_home/.openinstinct/run"
+( cd "$library_stage" && HOME="$smoke_home" OI_CONTROL_SOCKET="$smoke_home/.openinstinct/run/control.sock" \
+    "$bun_path" daemon/src/main.ts >"$smoke_home/boot.log" 2>&1 ) &
+smoke_pid=$!
+i=0; while [ "$i" -lt 60 ] && kill -0 "$smoke_pid" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+if kill -0 "$smoke_pid" 2>/dev/null; then
+  kill "$smoke_pid" 2>/dev/null; wait "$smoke_pid" 2>/dev/null || true
+  rm -rf "$smoke_home"
+else
+  wait "$smoke_pid" 2>/dev/null; smoke_rc=$?
+  printf '%s\n' "daemon failed to start from the staged source (exit $smoke_rc); existing daemon was left untouched:" >&2
+  tail -n 15 "$smoke_home/boot.log" >&2
+  rm -rf "$smoke_home"
+  exit 1
+fi
 # Wait (up to ~5 s) for every process matching a pattern to exit. bootout and
 # pkill return before the process is gone; replacing a bundle while its old
 # binary is still mapped is how a "stale" panel or a launchd respawn of the
