@@ -81,7 +81,7 @@ import { ImessageSender } from "./imessage/sender.ts";
 import { ImessageWatcher } from "./imessage/watcher.ts";
 import { NdjsonLogger } from "./log.ts";
 import { openVisibleChrome } from "./browser/open-visible.ts";
-import { openVisibleChrome } from "./browser/open-visible.ts";
+import { createChildTabRegistry, type ChildTabRegistry } from "./browser/child-tab.ts";
 import { seedComputerUsageInsight } from "./insights/computer-usage.ts";
 import { seedHeartbeat } from "./insights/heartbeat.ts";
 import { buildOrientation } from "./persona/orientation.ts";
@@ -121,6 +121,7 @@ interface CoreLane {
   readonly lifecycle: ChildLifecycle;
   readonly interim: InterimInbox;
   readonly childSweepTimer: ReturnType<typeof setInterval>;
+  readonly childTabs: ChildTabRegistry;
   readonly inbox: ReceiptInbox;
   readonly propagation: MonitorPropagation;
   readonly scheduler: MonitorScheduler;
@@ -845,6 +846,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonRu
     await cleanup(() => lane.inbox.stop());
     await cleanup(() => lane.interim.stop());
     await cleanup(() => lane.lifecycle.stop());
+    await cleanup(() => lane.childTabs.sweep(new Set()).then(() => undefined));
     await cleanup(() => lane.session.stop());
     await cleanup(() => lane.memory.drain());
     if (readableSession === lane.session) {
@@ -898,11 +900,16 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonRu
       const registry = new ChildRegistry(store);
       const journal = new TerminalJournal(paths.childrenJournal);
       statusReader = new StateStoreChildStatusReader(store);
+      // One shared window for every background task; each gets a tab, and
+      // tabs whose task is gone are swept with the child lifecycle.
+      const childTabs = createChildTabRegistry({ statePath: join(paths.run, "child-tabs.json") });
+      const liveTabPrefixes = (): ReadonlySet<string> => new Set(registry.listLive().map((child) => `${child.id.slice(0, 8)}-`));
       const taskRunner = options.childRunner ?? (drillMode
         ? new DrillChildRunner()
         : new SdkInProcessRunner({
           root: paths.children,
           modelPattern: runtimeConfig.mainSessionModel,
+          tabs: childTabs,
           ...(options.childSessionFactory === undefined ? {} : { factory: options.childSessionFactory }),
         }));
       const conversation = options.conversationRunner ?? (drillMode
@@ -1199,8 +1206,16 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonRu
         onEvent: (event, fields) => logger.write("info", "monitors", event, fields),
       });
 
-      childSweepTimer = setInterval(() => lifecycle!.sweep(), 30_000);
+      childSweepTimer = setInterval(() => {
+        lifecycle!.sweep();
+        void childTabs.sweep(liveTabPrefixes()).then((closed) => {
+          if (closed.length > 0) logger.write("info", "browser", "child_tabs_swept", { closed });
+        });
+      }, 30_000);
       childSweepTimer?.unref();
+      void childTabs.sweep(liveTabPrefixes()).then((closed) => {
+        if (closed.length > 0) logger.write("info", "browser", "child_tabs_swept", { closed, at: "start" });
+      });
       const lane: CoreLane = {
         config,
         session,
@@ -1208,6 +1223,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonRu
         inbox,
         interim,
         childSweepTimer,
+        childTabs,
         propagation,
         scheduler,
         triggers,

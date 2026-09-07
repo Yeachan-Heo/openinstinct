@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { createChildTabRegistry, type ChildTabCdp } from "../../src/browser/child-tab.ts";
 import { checkBrowserInput } from "../../src/browser/enforce.ts";
@@ -36,7 +39,7 @@ function fakeCdp(initial: Array<{ id: string; title: string; url: string }> = []
 describe("child tab registry", () => {
   test("creates one titled tab per child in the existing window, reuses it, and closes it on release", async () => {
     const f = fakeCdp([{ id: "owner", title: "Gmail", url: "https://mail.google.com" }]);
-    const tabs = createChildTabRegistry(f.cdp);
+    const tabs = createChildTabRegistry({ cdp: f.cdp });
 
     expect(await tabs.ensure("abcd1234-")).toEqual({ targetId: "t1", created: true });
     expect(await tabs.ensure("abcd1234-")).toEqual({ targetId: "t1", created: false });
@@ -51,7 +54,7 @@ describe("child tab registry", () => {
 
   test("concurrent first calls from the same child create a single tab", async () => {
     const f = fakeCdp();
-    const tabs = createChildTabRegistry(f.cdp);
+    const tabs = createChildTabRegistry({ cdp: f.cdp });
     const [a, b, c] = await Promise.all([tabs.ensure("p-"), tabs.ensure("p-"), tabs.ensure("p-")]);
     expect([a, b, c].map((r) => r?.targetId)).toEqual(["t1", "t1", "t1"]);
     expect(f.log.filter((l) => l.startsWith("create"))).toHaveLength(1);
@@ -59,17 +62,51 @@ describe("child tab registry", () => {
 
   test("adopts a tab that already carries the child's title (daemon restart) without creating another", async () => {
     const f = fakeCdp([{ id: "old", title: "p-", url: "https://x" }]);
-    const tabs = createChildTabRegistry(f.cdp);
+    const tabs = createChildTabRegistry({ cdp: f.cdp });
     expect(await tabs.ensure("p-")).toEqual({ targetId: "old", created: false });
     expect(await tabs.release("p-")).toBe(true);
     expect(f.pages).toHaveLength(0);
   });
 
+  test("sweep closes tabs whose task is gone, keeps live ones, forgets tabs the owner already closed, and adopts untracked titled tabs", async () => {
+    const f = fakeCdp([{ id: "owner", title: "Gmail", url: "https://mail.google.com" }, { id: "orphan", title: "dead0000-", url: "https://x" }]);
+    const tabs = createChildTabRegistry({ cdp: f.cdp });
+    await tabs.ensure("live0000-");
+    await tabs.ensure("done0000-");
+    const manuallyClosed = (await tabs.ensure("gone0000-"))!.targetId;
+    await f.cdp.closeTarget(manuallyClosed);
+    f.log.length = 0;
+
+    const closed = await tabs.sweep(new Set(["live0000-"]));
+    expect(closed.sort()).toEqual(["dead0000-", "done0000-"]);
+    expect(f.pages.map((p) => p.title)).toEqual(["Gmail", "live0000-"]);
+    // gone0000- was forgotten, not closed again
+    expect(f.log.filter((l) => l.startsWith("close"))).toHaveLength(2);
+    // a later sweep with nothing live closes the rest; the owner's own tab is never touched
+    expect(await tabs.sweep(new Set())).toEqual(["live0000-"]);
+    expect(f.pages.map((p) => p.title)).toEqual(["Gmail"]);
+  });
+
+  test("records survive a daemon restart so a new registry can close the old tabs", async () => {
+    const statePath = join(mkdtempSync(join(tmpdir(), "oi-tabs-")), "child-tabs.json");
+    const f = fakeCdp();
+    const first = createChildTabRegistry({ cdp: f.cdp, statePath });
+    const made = (await first.ensure("p-"))!.targetId;
+    // the task navigated: title no longer matches the prefix
+    f.pages.find((p) => p.id === made)!.title = "Some site";
+
+    const second = createChildTabRegistry({ cdp: f.cdp, statePath });
+    expect(await second.ensure("p-")).toEqual({ targetId: made, created: false });
+    expect(await second.sweep(new Set())).toEqual(["p-"]);
+    expect(f.pages).toHaveLength(0);
+  });
+
   test("Chrome not running: ensure is a no-op so the SDK's own launch path runs", async () => {
     const f = fakeCdp([], { down: true });
-    const tabs = createChildTabRegistry(f.cdp);
+    const tabs = createChildTabRegistry({ cdp: f.cdp });
     expect(await tabs.ensure("p-")).toBeUndefined();
     expect(await tabs.release("p-")).toBe(false);
+    expect(await tabs.sweep(new Set())).toEqual([]);
   });
 });
 

@@ -43,6 +43,8 @@ export interface SdkInProcessRunnerOptions {
   readonly factory?: ChildSessionFactory;
   /** Required when no factory is injected: the production SDK child model. */
   readonly modelPattern?: string;
+  /** Shared per-task tab registry for the single browser window. */
+  readonly tabs?: ChildTabRegistry;
 }
 
 /**
@@ -57,7 +59,7 @@ export class SdkInProcessRunner implements ChildRunner {
     if (!options.factory && !options.modelPattern) {
       throw new Error("SdkInProcessRunner needs modelPattern when using the production SDK factory");
     }
-    this.factory = options.factory ?? new SdkChildSessionFactory(options.modelPattern!);
+    this.factory = options.factory ?? new SdkChildSessionFactory(options.modelPattern!, options.tabs);
   }
 
   public async run(request: ChildRunRequest, signal: AbortSignal): Promise<ChildRunResult> {
@@ -132,9 +134,11 @@ export class SdkInProcessRunner implements ChildRunner {
 export class SdkChildSessionFactory implements ChildSessionFactory {
   public readonly agentRegistry = new AgentRegistry();
   private sessionSequence = 0;
-  private readonly tabs: ChildTabRegistry = createChildTabRegistry();
 
-  public constructor(private readonly modelPattern: string) {}
+  public constructor(
+    private readonly modelPattern: string,
+    private readonly tabs: ChildTabRegistry = createChildTabRegistry(),
+  ) {}
 
   public async create(input: {
     readonly childId: string;
