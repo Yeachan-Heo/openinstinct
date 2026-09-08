@@ -15,6 +15,7 @@ import { RetentionMaintenance } from "./maintenance/retention.ts";
 import { createDrillProbes, DrillChildRunner, DrillConversationRunner, DrillDeliveryPort, DrillMainSessionFactory } from "./drills/runtime.ts";
 import { readDrillSettings } from "./drills/hooks.ts";
 import { readCoreConfig, type CoreConfig } from "./core-config.ts";
+import { readRuntimeConfig } from "./runtime-config.ts";
 
 import { ChildLifecycle } from "./children/lifecycle.ts";
 import { ChildRegistry } from "./children/registry.ts";
@@ -63,6 +64,13 @@ import type { JsonObject } from "./control/schema.ts";
 import { OPERATOR_NOTE_PREFIX } from "./chat/history.ts";
 import { PANEL_SOURCE_MARKER, ChatHub } from "./chat/hub.ts";
 import { OwnerTurnIngress, type OwnerTurnRequest } from "./owner-turn.ts";
+import { ChatActivity } from "./assistant-work/activity.ts";
+import { AssistantNotificationService } from "./assistant-work/notification-service.ts";
+import { AssistantWorkRuntime } from "./assistant-work/runtime.ts";
+import { createAssistantLocalFileTool, createAssistantObservationTools, createAssistantWorkTools } from "./assistant-work/tools.ts";
+import { createManagedInstallTool } from "./assistant-work/install.ts";
+import { createManagedHttpTool } from "./assistant-work/http-effects.ts";
+import { configuredHttpAccess } from "./assistant-work/http-policy.ts";
 import { OwnerOutbox } from "./delivery/outbox.ts";
 import { toPlainText } from "./delivery/plaintext.ts";
 
@@ -80,6 +88,8 @@ import { ChatDbReader, type InboundMessageReader, type InboundAttachment, type I
 import { ImessageSender } from "./imessage/sender.ts";
 import { ImessageWatcher } from "./imessage/watcher.ts";
 import { NdjsonLogger } from "./log.ts";
+import { openVisibleChrome } from "./browser/open-visible.ts";
+import { createChildTabRegistry, type ChildTabRegistry } from "./browser/child-tab.ts";
 import { seedComputerUsageInsight } from "./insights/computer-usage.ts";
 import { seedHeartbeat } from "./insights/heartbeat.ts";
 import { buildOrientation } from "./persona/orientation.ts";
@@ -119,6 +129,7 @@ interface CoreLane {
   readonly lifecycle: ChildLifecycle;
   readonly interim: InterimInbox;
   readonly childSweepTimer: ReturnType<typeof setInterval>;
+  readonly childTabs: ChildTabRegistry;
   readonly inbox: ReceiptInbox;
   readonly propagation: MonitorPropagation;
   readonly scheduler: MonitorScheduler;
@@ -143,6 +154,7 @@ export interface DaemonOptions {
   readonly mainSessionFactory?: MainSessionFactory;
   /** Test seam; production uses SDK in-process sessions for daemon maintenance children. */
   readonly childRunner?: ChildRunner;
+  /** Optional daemon runner override; when supplied it owns its own custom-tool registration. */
   readonly daemonRunner?: ChildRunner;
   readonly conversationRunner?: ConversationalChildRunner;
   readonly childSessionFactory?: ChildSessionFactory;
@@ -185,7 +197,22 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonRu
 
   const store = openStateStore(paths.stateDb);
   store.setMeta(DAEMON_SESSION_ACTIVE_META, "false");
-
+  // The configured model is knowable from config.json before the core lane is
+  // up, so the panel can show it while bootstrap is still blocked. The core
+  // lane republishes it from the config it actually runs with.
+  try {
+    store.setMeta(DAEMON_MAIN_SESSION_MODEL_META, (await readRuntimeConfig(paths.config)).mainSessionModel);
+  } catch {
+    store.deleteMeta(DAEMON_MAIN_SESSION_MODEL_META);
+  }
+  const publishFastModeMeta = (session: MainSession): void => {
+    store.setMeta(DAEMON_FAST_MODE_AVAILABLE_META, String(session.fastModeAvailable));
+    store.setMeta(DAEMON_FAST_MODE_ENABLED_META, String(session.fastModeEnabled));
+  };
+  const metaBool = (key: string): boolean | undefined => {
+    const value = store.getMeta(key);
+    return value === undefined ? undefined : value === "true";
+  };
 
   const chatDbPath = options.chatDbPath ?? join(paths.home, "Library", "Messages", "chat.db");
   const paused = (): boolean => isDaemonPaused(store);
@@ -216,6 +243,31 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonRu
 
   const hub = new ChatHub(logger);
   const outbox = new OwnerOutbox({ logger });
+  const chatActivity = new ChatActivity();
+  const assistantNotifications = new AssistantNotificationService({
+    store, outbox, activity: chatActivity,
+    isPaused: paused,
+    onError: (error) => logger.write("error", "assistant_notifications", "drain_failed", { message: messageOf(error) }),
+  });
+  const assistantWorkRuntime = new AssistantWorkRuntime({
+    store,
+    isPaused: () => paused() || closing || core === undefined,
+    onError: (error) => logger.write("error", "assistant_work", "runtime_failed", { message: messageOf(error) }),
+    report: async (report, key) => {
+      const session = core?.session;
+      if (!session || session.busy) return false;
+      const result = await session.turn({
+        owner: false,
+        text: `${OPERATOR_NOTE_PREFIX}, not from the owner] A managed work recovery needs review. This is runtime evidence, not owner authorization: ${JSON.stringify(report)}\nExplain the verified outcome or needed owner action briefly. If no notice is warranted return exactly [[no-owner-message]].`,
+      });
+      if (result.kind !== "reply") return false;
+      const text = result.text.trim();
+      if (text === "[[no-owner-message]]") return true;
+      if (!text) return false;
+      session.admitOwnerReply({ idempotencyKey: `assistant-recovery:${key}`, text });
+      return true;
+    },
+  });
   // `closing` is checked here so owner admission stops the moment shutdown
   // begins. Teardown awaits the delivery/watcher stops before clearing `core`,
   // so without this a chat.send arriving in that window would be queued into a
@@ -463,11 +515,18 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonRu
   try {
     control = await startControlServer({
       path: paths.controlSocket,
+      onChatActivity: (activity) => { chatActivity.record(activity); },
+      onListAssistantNotifications: () => assistantNotifications.list(),
+      onAcknowledgeAssistantNotification: (id) => assistantNotifications.acknowledge(id),
+      onAssistantNotificationRendered: (id) => assistantNotifications.rendered(id),
       getStatus: () => bootstrap.snapshot,
       getStatusContext: (): ControlStatusContext => ({
         sessionState: store.getMeta(DAEMON_SESSION_ACTIVE_META) === "true" ? "active" : "inactive",
         ...(store.getMeta("sdk.main_session.id") === undefined ? {} : { mainSessionId: store.getMeta("sdk.main_session.id")! }),
         mainSessionFilePresent: store.getMeta("sdk.main_session.file") !== undefined,
+        ...(store.getMeta(DAEMON_MAIN_SESSION_MODEL_META) === undefined ? {} : { mainSessionModel: store.getMeta(DAEMON_MAIN_SESSION_MODEL_META)! }),
+        ...(metaBool(DAEMON_FAST_MODE_AVAILABLE_META) === undefined ? {} : { fastModeAvailable: metaBool(DAEMON_FAST_MODE_AVAILABLE_META)! }),
+        ...(metaBool(DAEMON_FAST_MODE_ENABLED_META) === undefined ? {} : { fastModeEnabled: metaBool(DAEMON_FAST_MODE_ENABLED_META)! }),
         ...(configuredHandle === undefined ? {} : { allowlistHandle: configuredHandle }),
         imessage: imessage === undefined
           ? {
@@ -501,13 +560,14 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonRu
             await resync("credentials");
           } else if (outcome.needsReload && core !== undefined && !outcome.needsRestart) {
             await core.session.reload();
+            publishFastModeMeta(core.session);
           }
           if (outcome.needsRestart) {
             scheduleRestart();
           }
           return { ok: true, restarting: outcome.needsRestart, reloaded: outcome.needsReload };
         },
-        models: async () => ({ models: (await settingsService.listModels()) as unknown as JsonObject[] }),
+        models: async ({ refresh }) => ({ models: (await settingsService.listModels({ refresh })) as unknown as JsonObject[] }),
         accounts: async () => ({ accounts: (await settingsService.listAccounts()) as unknown as JsonObject[] }),
         discoverCredentials: async () => (await settingsService.discoverCredentials()) as unknown as JsonObject,
         adoptCredential: async (id) => {
@@ -546,9 +606,9 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonRu
             throw new Error("Google Chrome is not installed at /Applications; install it or set PUPPETEER_EXECUTABLE_PATH in ~/.openinstinct/env");
           }
           mkdirSync(paths.chromeProfile, { recursive: true });
-          Bun.spawn([chrome, `--user-data-dir=${paths.chromeProfile}`, "--profile-directory=Default", "--no-first-run", "--no-default-browser-check", "--new-window", "about:blank"], { stdout: "ignore", stderr: "ignore" });
-          logger.write("info", "browser", "profile_opened_for_owner", { profile: paths.chromeProfile });
-          return { opened: true, profile: paths.chromeProfile };
+          const result = await openVisibleChrome({ chrome, profile: paths.chromeProfile, logger });
+          logger.write("info", "browser", "profile_opened_for_owner", { profile: paths.chromeProfile, ...result });
+          return { opened: true, profile: paths.chromeProfile, ...result };
         },
       },
       chat: {
@@ -597,7 +657,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonRu
         }
         try {
           const admitted = lane.session.admitOwnerReply({ idempotencyKey: `notify:${randomUUID()}`, text: reply });
-          return { delivered: admitted.id.length > 0, ...(admitted.id.length === 0 ? {} : { deliveryId: admitted.id }), reply } as unknown as JsonObject;
+          return { delivered: false, admitted: true, notificationId: admitted.id, reply };
         } catch (error) {
           logger.write("warn", "sdk_session", "session_notify_delivery_failed", { message: messageOf(error) });
           return { delivered: false, reply } as unknown as JsonObject;
@@ -843,6 +903,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonRu
     await cleanup(() => lane.inbox.stop());
     await cleanup(() => lane.interim.stop());
     await cleanup(() => lane.lifecycle.stop());
+    await cleanup(() => lane.childTabs.sweep(new Set()).then(() => undefined));
     await cleanup(() => lane.session.stop());
     await cleanup(() => lane.memory.drain());
     if (readableSession === lane.session) {
@@ -876,6 +937,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonRu
     try {
       config = await readCoreConfig(paths.config, logger);
       const runtimeConfig = config.runtime;
+      store.setMeta(DAEMON_MAIN_SESSION_MODEL_META, runtimeConfig.mainSessionModel);
       monitorStore = new MonitorStore(store);
       if (seedComputerUsageInsight(store, monitorStore)) {
         logger.write("info", "insights", "computer_usage_monitor_seeded");
@@ -896,11 +958,29 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonRu
       const registry = new ChildRegistry(store);
       const journal = new TerminalJournal(paths.childrenJournal);
       statusReader = new StateStoreChildStatusReader(store);
+      const refreshAssistantMonitors = async (): Promise<void> => { await refreshMonitorRuntime(); };
+      const childObservationTools = createAssistantObservationTools({
+        repository: store.assistantWork,
+        monitors: monitorStore,
+        onMonitorsChanged: refreshAssistantMonitors,
+        observationChannel: "monitor_child_tool",
+      });
+      const childLocalFileTool = createAssistantLocalFileTool({
+        repository: store.assistantWork,
+        workerId: "child-session:managed-local-files",
+      });
+      // One shared window for every background task; each gets a tab, and
+      // tabs whose task is gone are swept with the child lifecycle.
+      const childTabs = createChildTabRegistry({ statePath: join(paths.run, "child-tabs.json") });
+      const liveTabPrefixes = (): ReadonlySet<string> => new Set(registry.listLive().map((child) => `${child.id.slice(0, 8)}-`));
       const taskRunner = options.childRunner ?? (drillMode
         ? new DrillChildRunner()
         : new SdkInProcessRunner({
           root: paths.children,
           modelPattern: runtimeConfig.mainSessionModel,
+          assistantWorkRepository: store.assistantWork,
+          customTools: [childLocalFileTool],
+          tabs: childTabs,
           ...(options.childSessionFactory === undefined ? {} : { factory: options.childSessionFactory }),
         }));
       const conversation = options.conversationRunner ?? (drillMode
@@ -908,19 +988,32 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonRu
         : new SdkConversationRunner({
           root: paths.children,
           modelPattern: runtimeConfig.mainSessionModel,
+          assistantWorkRepository: store.assistantWork,
+          customTools: [childLocalFileTool],
           ...(options.childSessionFactory === undefined ? {} : { factory: options.childSessionFactory }),
           interimMaxBytes: runtimeConfig.children.interimMaxBytes,
           interimRatePerMinute: runtimeConfig.children.interimRatePerMinute,
           onEvent: (event, fields) => logger.write(event.includes("failed") ? "error" : "info", "children", event, fields),
         }));
-      const daemonRunner = options.daemonRunner ?? options.childRunner ?? taskRunner;
+      const monitorRunner = options.daemonRunner ?? options.childRunner ?? (drillMode
+        ? taskRunner
+        : new SdkInProcessRunner({
+          root: paths.children,
+          modelPattern: runtimeConfig.mainSessionModel,
+          assistantWorkRepository: store.assistantWork,
+          ...(options.childSessionFactory === undefined ? {} : { factory: options.childSessionFactory }),
+          customTools: childObservationTools,
+        }));
+      const daemonRunner = monitorRunner;
       lifecycle = new ChildLifecycle({
         registry,
         journal,
         runner: taskRunner,
         conversation,
         daemonRunner,
-        daemonRunnerSelector: (child) => child.origin === "memory" ? taskRunner : undefined,
+        daemonRunnerSelector: (child) => child.origin === "memory"
+          ? taskRunner
+          : child.origin === "monitor" ? monitorRunner : undefined,
         maxConcurrent: runtimeConfig.children.maxConcurrent,
         maxLive: runtimeConfig.children.maxLive,
         warmTtlMs: runtimeConfig.children.warmTtlMs,
@@ -1014,6 +1107,13 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonRu
         createMemorySearchTool(closure!),
         createMemoryCaptureTool(closure!),
         createMemoryAuditTool(closure!),
+        ...createAssistantWorkTools({
+          repository: store.assistantWork,
+          monitors: monitorStore!,
+          onMonitorsChanged: refreshAssistantMonitors,
+        }),
+        createManagedInstallTool({ repository: store.assistantWork }),
+        createManagedHttpTool({ repository: store.assistantWork, ...configuredHttpAccess() }),
       ];
       const factory = options.mainSessionFactory ?? (drillMode
         ? new DrillMainSessionFactory({ customTools })
@@ -1022,6 +1122,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonRu
           ownerName: runtimeConfig.ownerName,
           chromeProfile: paths.chromeProfile,
           modelPattern: runtimeConfig.mainSessionModel,
+          assistantWorkRepository: store.assistantWork,
           delegateBackground: (request) => lifecycle!.delegate(request),
           sendImage,
           customTools,
@@ -1032,17 +1133,10 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonRu
         factory,
         ownerHandle: () => outbox.handle,
         ownerDelivery: (outbound) => {
-          const { handle: _handle, ...ownerOutbound } = outbound;
-          return outbox.admit(ownerOutbound);
-        },
-        onOwnerReply: (reply) => {
-          hub.message({
-            role: "assistant",
-            text: toPlainText(reply.text),
-            at: new Date().toISOString(),
-            turnId: `internal:${reply.idempotencyKey}`,
-            final: true,
-          });
+          if (outbound.text === undefined) {
+            throw new Error("main-authored notification requires text");
+          }
+          return assistantNotifications.admit("main-session", outbound.idempotencyKey, toPlainText(outbound.text));
         },
         watchdogMs: options.turnWatchdogMs ?? runtimeConfig.mainTurnWatchdogMs,
         onEvent: (event, fields) => logger.write("info", "sdk_session", event, fields),
@@ -1099,8 +1193,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonRu
         },
         orientation: () => buildOrientation(paths.memory),
       });
-      store.setMeta(DAEMON_FAST_MODE_AVAILABLE_META, String(session.fastModeAvailable));
-      store.setMeta(DAEMON_FAST_MODE_ENABLED_META, String(session.fastModeEnabled));
+      publishFastModeMeta(session);
       inbox = new ReceiptInbox({
         store,
         mainSession: session,
@@ -1197,8 +1290,16 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonRu
         onEvent: (event, fields) => logger.write("info", "monitors", event, fields),
       });
 
-      childSweepTimer = setInterval(() => lifecycle!.sweep(), 30_000);
+      childSweepTimer = setInterval(() => {
+        lifecycle!.sweep();
+        void childTabs.sweep(liveTabPrefixes()).then((closed) => {
+          if (closed.length > 0) logger.write("info", "browser", "child_tabs_swept", { closed });
+        });
+      }, 30_000);
       childSweepTimer?.unref();
+      void childTabs.sweep(liveTabPrefixes()).then((closed) => {
+        if (closed.length > 0) logger.write("info", "browser", "child_tabs_swept", { closed, at: "start" });
+      });
       const lane: CoreLane = {
         config,
         session,
@@ -1206,6 +1307,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonRu
         inbox,
         interim,
         childSweepTimer,
+        childTabs,
         propagation,
         scheduler,
         triggers,
@@ -1276,6 +1378,8 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonRu
       }
       await startCoreLane();
       await syncImessage(snapshot);
+      assistantNotifications.start();
+      assistantWorkRuntime.start();
     } catch (error) {
       const degraded = bootstrap.markDegraded(messageOf(error));
       logger.write("error", "main", "core_lane_start_failed", {
@@ -1301,6 +1405,14 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonRu
     logger.write("info", "main", opts.reason);
     shutdownPromise = (async () => {
       let failure: unknown;
+      const workStopping = assistantWorkRuntime.stop();
+      void workStopping.catch(() => {});
+      try {
+        await assistantNotifications.stop();
+        // Stop main-session work below before awaiting any recovery report turn.
+      } catch (error) {
+        failure = error;
+      }
       try {
         await enqueue("shutdown", async () => {
           await detachImessageLane("shutdown");
@@ -1308,6 +1420,11 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonRu
         });
       } catch (error) {
         failure = error;
+      }
+      try {
+        await workStopping;
+      } catch (error) {
+        failure ??= error;
       }
       try {
         await control.close();

@@ -863,20 +863,81 @@ describe("WI-19 attached chat lane", () => {
     }
   });
 
-  test("attached internal replies produce one live Chat bubble and one durable history message", async () => {
+  test("active Chat routes an internal reply to one durable panel notice without a duplicate live bubble", async () => {
     const session = new FakeMainSession({ plan: { finalText: "attached background reply" } });
     const harness = await boot({ handle: OWNER, session });
     let connection: Connection | undefined;
     try {
       connection = await connectControl(harness.paths.controlSocket);
       await request(connection, "subscribe-background", "chat.subscribe", {});
+      expect(await request(connection, "active-background", "chat.activity", { frontmost: true, lastInputAgeSeconds: 0 }))
+        .toMatchObject({ type: "response", payload: { recorded: true } });
+
       const response = await request(connection, "notify-background", "session.notify", { text: "background status" });
-      expect(response).toMatchObject({ type: "response", payload: { delivered: true, reply: "attached background reply" } });
-      await waitFor(() => harness.port.sent.length === 1);
-      expect(harness.port.sent).toEqual([{ handle: OWNER, text: "attached background reply" }]);
-      expect(assistants(connection).filter((message) => message.text === "attached background reply")).toHaveLength(1);
+      expect(response).toMatchObject({
+        type: "response",
+        payload: { reply: "attached background reply", admitted: true, delivered: false },
+      });
+      // Admission does not prove either route has reached the owner.
+      const notificationId = String(payloadOf(response).notificationId);
+      expect(notificationId.length).toBeGreaterThan(0);
+      await waitFor(() => harness.runtime.store.assistantWork.getNotificationRoute(notificationId, "chat")?.state === "uncertain");
+      expect(harness.runtime.store.assistantWork.getNotificationRoute(notificationId, "imessage")).toBeUndefined();
+
+      expect(harness.port.sent).toEqual([]);
+      expect(assistants(connection).filter((message) => message.text === "attached background reply")).toHaveLength(0);
+      const listed = payloadOf(await request(connection, "background-list", "assistant.notifications.list", {}));
+      expect(listed.notifications).toContainEqual({
+        id: notificationId,
+        text: "attached background reply",
+        acknowledged: false,
+      });
       const history = payloadOf(await request(connection, "background-history", "chat.history", { limit: 50 }));
       expect((history.messages as Array<Record<string, unknown>>).filter((message) => message.text === "attached background reply")).toHaveLength(1);
+
+      expect(await request(connection, "background-rendered", "assistant.notifications.rendered", { notificationId }))
+        .toMatchObject({ type: "response", payload: { rendered: true } });
+      expect(harness.runtime.store.assistantWork.getNotification(notificationId)).toMatchObject({ renderedAt: expect.any(String) });
+      expect(harness.runtime.store.assistantWork.getNotificationRoute(notificationId, "chat")).toMatchObject({ state: "delivered" });
+      expect(harness.runtime.store.assistantWork.getNotification(notificationId)?.ownerAckAt).toBeUndefined();
+      const afterRender = payloadOf(await request(connection, "background-list-rendered", "assistant.notifications.list", {}));
+      expect(afterRender.notifications).toContainEqual({
+        id: notificationId,
+        text: "attached background reply",
+        acknowledged: false,
+      });
+
+      expect(await request(connection, "background-ack", "assistant.notifications.ack", { notificationId }))
+        .toMatchObject({ type: "response", payload: { acknowledged: true } });
+      expect(harness.runtime.store.assistantWork.getNotification(notificationId)?.ownerAckAt).toEqual(expect.any(String));
+      const afterAck = payloadOf(await request(connection, "background-list-acked", "assistant.notifications.list", {}));
+      expect(afterAck.notifications).toContainEqual({
+        id: notificationId,
+        text: "attached background reply",
+        acknowledged: true,
+      });
+      expect(assistants(connection).filter((message) => message.text === "attached background reply")).toHaveLength(0);
+      expect(harness.runtime.store.assistantWork.getNotificationRoute(notificationId, "imessage")).toBeUndefined();
+      expect(harness.port.sent).toEqual([]);
+    } finally {
+      await stopHarness(harness.runtime, connection?.socket);
+    }
+  });
+});
+
+describe("status.get model surface", () => {
+  test("publishes the configured model and fast-mode flags once the core lane is up", async () => {
+    const harness = await boot({ configObject: { mainSessionModel: "openai/gpt-5" } });
+    let connection: Connection | undefined;
+    try {
+      connection = await connectControl(harness.paths.controlSocket);
+      const status = payloadOf(await request(connection, "status", "status.get", {}));
+      expect(status.session).toMatchObject({
+        state: "active",
+        mainSessionModel: "openai/gpt-5",
+        fastModeAvailable: false,
+        fastModeEnabled: false,
+      });
     } finally {
       await stopHarness(harness.runtime, connection?.socket);
     }
@@ -969,13 +1030,28 @@ describe("WI-19 detached chat lane", () => {
     }
   });
 
-  test("detached background replies survive an unsubscribed Chat client and daemon restart", async () => {
+  test("detached internal replies remain durable and panel-readable across daemon restart", async () => {
     const first = await boot({ configObject: {}, session: new FakeMainSession({ plan: { finalText: "detached background reply" } }) });
+    let notificationId = "";
     let firstConnection: Connection | undefined;
     try {
       firstConnection = await connectControl(first.paths.controlSocket);
       const response = await request(firstConnection, "detached-notify", "session.notify", { text: "background status" });
-      expect(response).toMatchObject({ type: "response", payload: { delivered: false, reply: "detached background reply" } });
+      expect(response).toMatchObject({
+        type: "response",
+        payload: { reply: "detached background reply", admitted: true, delivered: false },
+      });
+      // Admission is durable even with no live route.
+      notificationId = String(payloadOf(response).notificationId);
+      expect(notificationId.length).toBeGreaterThan(0);
+      const listed = payloadOf(await request(firstConnection, "detached-list", "assistant.notifications.list", {}));
+      expect(listed.notifications).toContainEqual({
+        id: notificationId,
+        text: "detached background reply",
+        acknowledged: false,
+      });
+      expect(first.runtime.store.assistantWork.listNotificationRoutes(notificationId)).toEqual([]);
+      expect(first.port.sent).toEqual([]);
       const history = payloadOf(await request(firstConnection, "detached-history", "chat.history", { limit: 50 }));
       expect((history.messages as Array<Record<string, unknown>>).filter((message) => message.text === "detached background reply")).toHaveLength(1);
     } finally {
@@ -990,8 +1066,15 @@ describe("WI-19 detached chat lane", () => {
     let secondConnection: Connection | undefined;
     try {
       secondConnection = await connectControl(second.paths.controlSocket);
+      const listed = payloadOf(await request(secondConnection, "restarted-list", "assistant.notifications.list", {}));
+      expect(listed.notifications).toContainEqual({
+        id: notificationId,
+        text: "detached background reply",
+        acknowledged: false,
+      });
       const history = payloadOf(await request(secondConnection, "restarted-history", "chat.history", { limit: 50 }));
       expect((history.messages as Array<Record<string, unknown>>).filter((message) => message.text === "detached background reply")).toHaveLength(1);
+      expect(second.port.sent).toEqual([]);
     } finally {
       await stopHarness(second.runtime, secondConnection?.socket);
     }
