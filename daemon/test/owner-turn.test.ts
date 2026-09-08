@@ -478,6 +478,7 @@ describe("OwnerTurnIngress", () => {
       h.ingress.onTurnStarted(run.active);
       h.ingress.onSegment("We decided A.");
       h.ingress.onSegment("And B follows from it.");
+      // Final-after-segments is deduplicated upstream: the settle carries no text.
       await settle(run, { kind: "reply", text: "" });
 
       expect(messages(h).filter((m) => m.final === true)).toHaveLength(0);
@@ -490,6 +491,7 @@ describe("OwnerTurnIngress", () => {
       });
       expect(h.logger.events("turn_finished").at(-1)).toMatchObject({ segmentsOnly: true, captured: true });
 
+      // A turn that produced neither segments nor text captures nothing.
       h.session.running = false;
       const empty = h.ingress.admit(request("empty", "imessage", "hello?"));
       expect(await empty).toBe("started");

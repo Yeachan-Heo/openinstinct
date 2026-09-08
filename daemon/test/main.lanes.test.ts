@@ -576,7 +576,7 @@ describe("main lane lifecycle", () => {
     }
   });
 
-  test("routes session.notify to the ledger only while the iMessage lane is attached", async () => {
+  test("routes inactive notices to iMessage once and retains detached notices for the panel", async () => {
     const root = mkdtempSync(join(tmpdir(), "openinstinct-lanes-notify-"));
     roots.push(root);
     const paths = pathsFor(root);
@@ -594,14 +594,35 @@ describe("main lane lifecycle", () => {
     const runtime = await startHarness({ paths, probes, factory, port, chatDbPath });
     try {
       await waitForStatus(runtime, (status) => (status.imessage as Record<string, unknown>).state === "attached");
+      await requestControl(paths.controlSocket, "chat.activity", { frontmost: false, lastInputAgeSeconds: 0 });
       const attached = await requestControl(paths.controlSocket, "session.notify", { text: "attached note" });
-      expect(attached.payload).toMatchObject({ delivered: true });
+      expect(attached.payload).toMatchObject({ reply: "lane reply", admitted: true, delivered: false });
+      // The returned id proves durable notification admission, not remote delivery.
+      const attachedId = String(attached.payload.notificationId);
+      expect(attachedId.length).toBeGreaterThan(0);
       await waitFor(() => port.sent.length === 1);
+      await waitFor(() => runtime.store.assistantWork.getNotificationRoute(attachedId, "imessage")?.state === "delivered", 5_000);
+      expect(runtime.store.assistantWork.getNotificationRoute(attachedId, "chat")).toBeUndefined();
+      await Bun.sleep(1_100);
+      expect(port.sent).toEqual([{ handle, text: "lane reply" }]);
+      const attachedList = (await requestControl(paths.controlSocket, "assistant.notifications.list")).payload;
+      expect(attachedList.notifications).toContainEqual({ id: attachedId, text: "lane reply", acknowledged: false });
+
       probes.fda = { status: "denied", reason: "FDA revoked" };
       await waitForStatus(runtime, (status) => (status.imessage as Record<string, unknown>).reason === "fda_denied");
       const detached = await requestControl(paths.controlSocket, "session.notify", { text: "detached note" });
-      expect(detached.payload).toMatchObject({ delivered: false });
-      expect(logEntries(paths).some((entry) => entry.event === "delivery_skipped_no_imessage_lane")).toBe(true);
+      expect(detached.payload).toMatchObject({ reply: "lane reply", admitted: true, delivered: false });
+      // Detached admission still returns a durable id even though no route exists.
+      const detachedId = String(detached.payload.notificationId);
+      expect(detachedId.length).toBeGreaterThan(0);
+      await waitFor(() => runtime.store.assistantWork.getNotification(detachedId) !== undefined);
+      const detachedList = (await requestControl(paths.controlSocket, "assistant.notifications.list")).payload;
+      expect(detachedList.notifications).toContainEqual({ id: detachedId, text: "lane reply", acknowledged: false });
+      expect(runtime.store.assistantWork.listNotificationRoutes(detachedId)).toEqual([]);
+      await Bun.sleep(1_100);
+      expect(port.sent).toEqual([{ handle, text: "lane reply" }]);
+      const history = (await requestControl(paths.controlSocket, "chat.history", { limit: 50 })).payload;
+      expect((history.messages as Array<Record<string, unknown>>).filter((message) => message.text === "lane reply")).toHaveLength(2);
     } finally {
       await runtime.stop();
     }
@@ -673,7 +694,7 @@ describe("main lane lifecycle", () => {
     }
   });
 
-  test("drops one paused-backlog notice while the iMessage lane is detached", async () => {
+  test("keeps one paused-backlog notice durable while the iMessage lane is detached", async () => {
     const root = mkdtempSync(join(tmpdir(), "openinstinct-lanes-paused-"));
     roots.push(root);
     const paths = pathsFor(root);
@@ -688,9 +709,18 @@ describe("main lane lifecycle", () => {
       setDaemonPaused(runtime.store, true);
       recordSuppressedWhilePaused(runtime.store, 2);
       await requestControl(paths.controlSocket, "daemon.resume");
-      await waitFor(() => logEntries(paths).some((entry) => entry.event === "delivery_skipped_no_imessage_lane" && String(entry.idempotencyKey).startsWith("paused-backlog:")));
-      expect(logEntries(paths).filter((entry) => entry.event === "delivery_skipped_no_imessage_lane" && String(entry.idempotencyKey).startsWith("paused-backlog:")).length).toBe(1);
+      await waitFor(() => runtime.store.assistantWork.listNotifications().some((notice) => notice.body === "lane reply"));
+
+      const notices = runtime.store.assistantWork.listNotifications().filter((notice) => notice.body === "lane reply");
+      expect(notices).toHaveLength(1);
+      const notice = notices[0]!;
+      const listed = (await requestControl(paths.controlSocket, "assistant.notifications.list")).payload;
+      expect(listed.notifications).toContainEqual({ id: notice.id, text: "lane reply", acknowledged: false });
+      expect(runtime.store.assistantWork.listNotificationRoutes(notice.id)).toEqual([]);
       expect(runtime.store.listDeliveries()).toHaveLength(0);
+      const history = (await requestControl(paths.controlSocket, "chat.history", { limit: 50 })).payload;
+      expect((history.messages as Array<Record<string, unknown>>).filter((message) => message.text === "lane reply")).toHaveLength(1);
+      expect(logEntries(paths).some((entry) => entry.event === "delivery_skipped_no_imessage_lane" && String(entry.idempotencyKey).startsWith("paused-backlog:"))).toBe(false);
     } finally {
       await runtime.stop();
     }

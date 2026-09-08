@@ -18,6 +18,8 @@ public final class PanelViewModel: ObservableObject {
     @Published public private(set) var togglingMonitorIDs: Set<String> = []
     @Published public private(set) var runningMonitorIDs: Set<String> = []
     @Published public private(set) var recoveryInProgress = false
+    /// Bumped after a forced `models.list` refresh so open windows can re-pull the list.
+    @Published public private(set) var modelsRefreshedAt: Date?
 
     private let transport: any ControlTransport
     private let daemonKickstart: @Sendable () async throws -> Void
@@ -65,6 +67,32 @@ public final class PanelViewModel: ObservableObject {
             return
         }
         await refreshMonitors()
+    }
+
+    /// The panel's reload button: everything `refresh()` does plus a forced model-list reload.
+    public func reload() async {
+        await refresh()
+        guard connectionState == .connected else {
+            return
+        }
+        await refreshModels()
+    }
+
+    /// Forces the daemon to re-run `gjc --list-models`, dropping its cached list and restarting its TTL.
+    public func refreshModels() async {
+        do {
+            let frame = try await transport.request(.modelsList(id: requestID(), payload: ModelsListPayload(refresh: true)))
+            switch frame {
+            case .response(.modelsList):
+                modelsRefreshedAt = Date()
+            case .error(let error):
+                notice = error.message
+            default:
+                throw PanelModelError.unexpectedFrame
+            }
+        } catch {
+            markDaemonAbsent(error)
+        }
     }
 
     public func refreshStatus() async {
@@ -416,7 +444,7 @@ public final class PanelViewModel: ObservableObject {
         let status: Int32
     }
 
-    private nonisolated static func kickstartDaemon() async throws {
+    nonisolated static func kickstartDaemon() async throws {
         let result = await Task.detached(priority: .userInitiated) {
             PanelViewModel.runLaunchctlKickstart()
         }.value

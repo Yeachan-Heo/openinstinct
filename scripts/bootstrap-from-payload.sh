@@ -8,13 +8,15 @@ home_dir=${HOME:?}
 state_home="$home_dir/.openinstinct"
 mkdir -p "$state_home/bin"
 
-# Bundled bun becomes the runtime unless the owner already has one on PATH.
-if ! command -v bun >/dev/null 2>&1; then
-  cp "$payload/bun" "$state_home/bin/bun-runtime"
-  chmod 755 "$state_home/bin/bun-runtime"
-  ln -sf "$state_home/bin/bun-runtime" "$state_home/bin/bun"
-fi
-PATH="$state_home/bin:$home_dir/.local/bin:$PATH"; export PATH
+# The bundled bun is the runtime, always. A host bun on PATH is not consulted:
+# an older one cannot read this lockfile ("Unknown lockfile version", #1), and
+# the daemon must run on the exact version the release was built against.
+cp "$payload/bun" "$state_home/bin/bun-runtime.new"
+chmod 755 "$state_home/bin/bun-runtime.new"
+mv -f "$state_home/bin/bun-runtime.new" "$state_home/bin/bun-runtime"
+ln -sf "$state_home/bin/bun-runtime" "$state_home/bin/bun"
+PATH="$state_home/bin:$PATH"; export PATH
+[ "$(command -v bun)" = "$state_home/bin/bun" ] || { echo "error: bundled bun did not take precedence on PATH" >&2; exit 1; }
 
 # gjc is installed by install.sh from the payload (pinned to the SDK version).
 
@@ -35,4 +37,4 @@ if [ -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ] && ! gr
   printf 'PUPPETEER_EXECUTABLE_PATH=/Applications/Google Chrome.app/Contents/MacOS/Google Chrome\n' >> "$env_file"
 fi
 
-OI_SKIP_PANEL_BUILD=1 OI_GJC_PAYLOAD="$payload/gjc" sh "$src/scripts/install.sh"
+OI_SKIP_PANEL_BUILD=1 OI_BUN="$state_home/bin/bun-runtime" OI_GJC_PAYLOAD="$payload/gjc" sh "$src/scripts/install.sh"

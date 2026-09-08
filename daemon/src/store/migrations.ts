@@ -5,7 +5,7 @@ export interface Migration {
   readonly requiresForeignKeysDisabled?: boolean;
 }
 
-export const LATEST_SCHEMA_VERSION = 8;
+export const LATEST_SCHEMA_VERSION = 9;
 
 export const MIGRATIONS: readonly Migration[] = [
   {
@@ -291,6 +291,268 @@ export const MIGRATIONS: readonly Migration[] = [
       );
       CREATE INDEX child_interim_unbatched_idx ON child_interim_messages (batch_id, created_at);
       CREATE INDEX child_interim_batches_state_idx ON child_interim_batches (state, created_at);
+    `,
+  },
+  {
+    version: 9,
+    sql: `
+      CREATE TABLE assistant_work_works (
+        id TEXT PRIMARY KEY,
+        stable_key TEXT NOT NULL UNIQUE,
+        title TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('open', 'completed', 'cancelled')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE assistant_work_observations (
+        id TEXT PRIMARY KEY,
+        work_id TEXT NOT NULL REFERENCES assistant_work_works(id),
+        source TEXT NOT NULL,
+        occurrence_key TEXT NOT NULL,
+        provenance_principal TEXT NOT NULL CHECK (provenance_principal IN ('owner', 'third_party', 'system')),
+        provenance_channel TEXT NOT NULL,
+        provenance_subject TEXT NOT NULL,
+        provenance_evidence_id TEXT NOT NULL,
+        observed_at TEXT NOT NULL,
+        evidence_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE (source, occurrence_key)
+      );
+      CREATE INDEX assistant_work_observations_work_idx
+        ON assistant_work_observations (work_id, observed_at, created_at);
+
+      CREATE TABLE assistant_work_actions (
+        id TEXT PRIMARY KEY,
+        work_id TEXT NOT NULL REFERENCES assistant_work_works(id),
+        semantic_key TEXT NOT NULL,
+        current_revision INTEGER NOT NULL CHECK (current_revision > 0),
+        current_digest TEXT NOT NULL CHECK (length(current_digest) = 64),
+        state TEXT NOT NULL CHECK (state IN (
+          'planned', 'approval_pending', 'authorized', 'claimed_pre_effect', 'effect_started',
+          'confirmed', 'definitive_failed', 'ambiguous', 'cancelled', 'expired', 'blocked'
+        )),
+        active_attempt_id TEXT,
+        cancelled_at TEXT,
+        cancel_reason TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (work_id, semantic_key)
+      );
+      CREATE INDEX assistant_work_actions_state_idx
+        ON assistant_work_actions (state, updated_at, created_at);
+
+      CREATE TABLE assistant_work_action_revisions (
+        action_id TEXT NOT NULL REFERENCES assistant_work_actions(id),
+        revision INTEGER NOT NULL CHECK (revision > 0),
+        digest TEXT NOT NULL CHECK (length(digest) = 64),
+        effect_class TEXT NOT NULL CHECK (effect_class IN (
+          'ordinary_local_edit', 'ordinary_local_install', 'delete_existing',
+          'bulk_existing_user_assets', 'core_setting_change', 'account_rights_change',
+          'cost_increase', 'external_message', 'external_mutation', 'uncovered'
+        )),
+        recipient TEXT,
+        topic TEXT,
+        action_key TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        scope_json TEXT,
+        cost_json TEXT,
+        deadline_at TEXT,
+        blocked_evidence_json TEXT,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (action_id, revision),
+        UNIQUE (action_id, revision, digest),
+        CHECK (effect_class <> 'external_message' OR (recipient IS NOT NULL AND topic IS NOT NULL)),
+        CHECK (effect_class <> 'uncovered' OR blocked_evidence_json IS NOT NULL),
+        CHECK (effect_class = 'uncovered' OR blocked_evidence_json IS NULL)
+      );
+
+      CREATE TABLE assistant_work_owner_rules (
+        id TEXT PRIMARY KEY,
+        revision INTEGER NOT NULL CHECK (revision > 0),
+        state TEXT NOT NULL CHECK (state IN ('enabled', 'revoked')),
+        effect_class TEXT NOT NULL CHECK (effect_class = 'external_message'),
+        recipient TEXT NOT NULL,
+        topic TEXT NOT NULL,
+        action_key TEXT NOT NULL,
+        provenance_principal TEXT NOT NULL CHECK (provenance_principal = 'owner'),
+        provenance_channel TEXT NOT NULL,
+        provenance_subject TEXT NOT NULL,
+        provenance_evidence_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        revoked_at TEXT,
+        UNIQUE (effect_class, recipient, topic, action_key)
+      );
+      CREATE INDEX assistant_work_owner_rules_match_idx
+        ON assistant_work_owner_rules (state, effect_class, recipient, topic, action_key);
+
+      CREATE TABLE assistant_work_explicit_approvals (
+        id TEXT PRIMARY KEY,
+        action_id TEXT NOT NULL,
+        action_revision INTEGER NOT NULL,
+        action_digest TEXT NOT NULL CHECK (length(action_digest) = 64),
+        state TEXT NOT NULL CHECK (state IN ('active', 'consumed', 'invalidated', 'revoked')),
+        provenance_principal TEXT NOT NULL CHECK (provenance_principal = 'owner'),
+        provenance_channel TEXT NOT NULL,
+        provenance_subject TEXT NOT NULL,
+        provenance_evidence_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        consumed_at TEXT,
+        consumed_attempt_id TEXT,
+        invalidated_at TEXT,
+        revoked_at TEXT,
+        FOREIGN KEY (action_id, action_revision, action_digest)
+          REFERENCES assistant_work_action_revisions(action_id, revision, digest)
+      );
+      CREATE INDEX assistant_work_explicit_approvals_active_idx
+        ON assistant_work_explicit_approvals (action_id, action_revision, action_digest, state, created_at);
+
+      CREATE TABLE assistant_work_attempts (
+        id TEXT PRIMARY KEY,
+        action_id TEXT NOT NULL,
+        action_revision INTEGER NOT NULL,
+        action_digest TEXT NOT NULL CHECK (length(action_digest) = 64),
+        sequence INTEGER NOT NULL CHECK (sequence > 0),
+        state TEXT NOT NULL CHECK (state IN (
+          'claimed_pre_effect', 'effect_started', 'confirmed', 'definitive_failed', 'ambiguous', 'cancelled'
+        )),
+        worker_id TEXT NOT NULL,
+        authorization_source TEXT NOT NULL CHECK (authorization_source IN ('local_policy', 'owner_rule', 'owner_explicit')),
+        authorization_id TEXT,
+        authorization_revision INTEGER,
+        claimed_at TEXT NOT NULL,
+        effect_started_at TEXT,
+        settled_at TEXT,
+        outcome_json TEXT,
+        recovered_at TEXT,
+        recovery_count INTEGER NOT NULL DEFAULT 0 CHECK (recovery_count >= 0),
+        updated_at TEXT NOT NULL,
+        UNIQUE (action_id, action_revision, sequence),
+        FOREIGN KEY (action_id, action_revision, action_digest)
+          REFERENCES assistant_work_action_revisions(action_id, revision, digest),
+        CHECK (authorization_source <> 'owner_explicit' OR authorization_id IS NOT NULL),
+        CHECK (authorization_source <> 'owner_rule' OR (authorization_id IS NOT NULL AND authorization_revision IS NOT NULL))
+      );
+      CREATE UNIQUE INDEX assistant_work_attempts_live_revision_idx
+        ON assistant_work_attempts (action_id, action_revision)
+        WHERE state IN ('claimed_pre_effect', 'effect_started', 'ambiguous', 'confirmed');
+      CREATE INDEX assistant_work_attempts_recovery_idx
+        ON assistant_work_attempts (state, claimed_at, action_id, sequence);
+
+      CREATE TABLE assistant_work_recontacts (
+        id TEXT PRIMARY KEY,
+        action_id TEXT NOT NULL,
+        action_revision INTEGER NOT NULL,
+        ordinal INTEGER NOT NULL CHECK (ordinal > 0),
+        scheduled_at TEXT NOT NULL,
+        context_json TEXT,
+        created_at TEXT NOT NULL,
+        UNIQUE (action_id, action_revision, ordinal),
+        FOREIGN KEY (action_id, action_revision)
+          REFERENCES assistant_work_action_revisions(action_id, revision)
+      );
+      CREATE INDEX assistant_work_recontacts_due_idx
+        ON assistant_work_recontacts (scheduled_at, action_id, action_revision, ordinal);
+
+      CREATE TABLE assistant_work_followup_policies (
+        work_id TEXT PRIMARY KEY REFERENCES assistant_work_works(id),
+        action_id TEXT NOT NULL REFERENCES assistant_work_actions(id),
+        action_revision INTEGER NOT NULL CHECK (action_revision > 0),
+        action_digest TEXT NOT NULL CHECK (length(action_digest) = 64),
+        revision INTEGER NOT NULL CHECK (revision > 0),
+        enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+        interval_ms INTEGER NOT NULL CHECK (interval_ms > 0),
+        max_attempts INTEGER NOT NULL CHECK (max_attempts >= 0),
+        next_due_at TEXT,
+        next_ordinal INTEGER NOT NULL DEFAULT 1 CHECK (next_ordinal > 0),
+        provenance_principal TEXT NOT NULL CHECK (provenance_principal = 'owner'),
+        provenance_channel TEXT NOT NULL,
+        provenance_subject TEXT NOT NULL,
+        provenance_evidence_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (action_id, action_revision, action_digest)
+          REFERENCES assistant_work_action_revisions(action_id, revision, digest)
+      );
+      CREATE INDEX assistant_work_followup_policies_due_idx
+        ON assistant_work_followup_policies (enabled, next_due_at, work_id);
+
+      CREATE TABLE assistant_work_followup_dispatches (
+        id TEXT PRIMARY KEY,
+        work_id TEXT NOT NULL REFERENCES assistant_work_works(id),
+        policy_revision INTEGER NOT NULL CHECK (policy_revision > 0),
+        ordinal INTEGER NOT NULL CHECK (ordinal > 0),
+        original_action_id TEXT NOT NULL REFERENCES assistant_work_actions(id),
+        action_id TEXT NOT NULL REFERENCES assistant_work_actions(id),
+        state TEXT NOT NULL CHECK (state IN ('due', 'claimed', 'completed', 'skipped')),
+        due_at TEXT NOT NULL,
+        worker_id TEXT,
+        claimed_at TEXT,
+        completed_at TEXT,
+        outcome_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (work_id, policy_revision, ordinal),
+        CHECK (state <> 'claimed' OR (worker_id IS NOT NULL AND claimed_at IS NOT NULL)),
+        CHECK (state NOT IN ('completed', 'skipped') OR completed_at IS NOT NULL)
+      );
+      CREATE INDEX assistant_work_followup_dispatches_state_idx
+        ON assistant_work_followup_dispatches (state, due_at, work_id, policy_revision, ordinal);
+
+      CREATE TABLE assistant_work_reports (
+        id TEXT PRIMARY KEY,
+        code TEXT NOT NULL,
+        work_id TEXT REFERENCES assistant_work_works(id),
+        action_id TEXT REFERENCES assistant_work_actions(id),
+        attempt_id TEXT REFERENCES assistant_work_attempts(id),
+        dispatch_id TEXT REFERENCES assistant_work_followup_dispatches(id),
+        detail_json TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('pending', 'admitted')),
+        created_at TEXT NOT NULL,
+        admitted_at TEXT,
+        updated_at TEXT NOT NULL,
+        CHECK (state <> 'admitted' OR admitted_at IS NOT NULL)
+      );
+      CREATE INDEX assistant_work_reports_state_idx
+        ON assistant_work_reports (state, created_at, id);
+
+      CREATE TABLE assistant_work_notifications (
+        id TEXT PRIMARY KEY,
+        body TEXT NOT NULL,
+        work_id TEXT REFERENCES assistant_work_works(id),
+        action_id TEXT REFERENCES assistant_work_actions(id),
+        rendered_at TEXT,
+        owner_ack_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX assistant_work_notifications_work_idx
+        ON assistant_work_notifications (work_id, created_at);
+      CREATE INDEX assistant_work_notifications_action_idx
+        ON assistant_work_notifications (action_id, created_at);
+
+      CREATE TABLE assistant_work_notification_routes (
+        notification_id TEXT NOT NULL REFERENCES assistant_work_notifications(id),
+        route TEXT NOT NULL CHECK (route IN ('chat', 'imessage')),
+        state TEXT NOT NULL CHECK (state IN (
+          'reserved', 'dispatching', 'delivered', 'uncertain', 'failed_definitive'
+        )),
+        worker_id TEXT,
+        reserved_at TEXT NOT NULL,
+        dispatching_at TEXT,
+        settled_at TEXT,
+        external_id TEXT,
+        detail_json TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (notification_id, route),
+        CHECK (state NOT IN ('dispatching', 'delivered', 'uncertain', 'failed_definitive') OR worker_id IS NOT NULL),
+        CHECK (state <> 'dispatching' OR dispatching_at IS NOT NULL),
+        CHECK (state NOT IN ('delivered', 'uncertain', 'failed_definitive') OR settled_at IS NOT NULL)
+      );
+      CREATE INDEX assistant_work_notification_routes_recovery_idx
+        ON assistant_work_notification_routes (state, dispatching_at, notification_id, route);
     `,
   },
 ];

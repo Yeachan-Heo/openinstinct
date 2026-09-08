@@ -15,6 +15,7 @@ enum ChatViewModelChecks {
         failures.append(contentsOf: await composerMatrix())
         failures.append(contentsOf: await sendErrorRefreshesStatus())
         failures.append(contentsOf: await suppressedPausedDoesNotAppend())
+        failures.append(contentsOf: await resumeClearsPausedBanner())
         return failures
     }
 
@@ -349,6 +350,52 @@ enum ChatViewModelChecks {
         return failures
     }
 
+    /// Pause -> resume observed through status polling must clear the banner and
+    /// composer block; a resumed daemon that still shows "Paused" is the bug.
+    private static func resumeClearsPausedBanner() async -> [String] {
+        let transport = ChatScriptedTransport(responses: [
+            statusFrame(),
+            .response(.chatSend(id: "send-1", payload: ChatSendResponsePayload(turnId: "paused-turn", outcome: "suppressed_paused"))),
+            statusFrame(paused: true),
+            statusFrame(paused: false),
+            statusFrame(state: .credentialsBlocked, remediation: "Sign in first."),
+            statusFrame(paused: false),
+        ])
+        let panel = PanelViewModel(transport: transport)
+        await panel.refreshStatus()
+        let model = ChatViewModel(panel: panel, transport: transport)
+        await model.send("saved while paused")
+
+        var failures: [String] = []
+        await panel.refreshStatus()
+        model.syncPanelPresentation()
+        if model.banner != "Paused" || model.composerBlock != "Paused" {
+            failures.append("paused status poll did not keep the Paused banner/composer block")
+        }
+
+        await panel.refreshStatus()
+        model.syncPanelPresentation()
+        if model.banner != nil {
+            failures.append("resume status poll left the banner as \(model.banner ?? "nil")")
+        }
+        if model.composerBlock != nil {
+            failures.append("resume status poll left the composer blocked with \(model.composerBlock ?? "nil")")
+        }
+
+        await panel.refreshStatus()
+        model.syncPanelPresentation()
+        if model.banner != "Sign in first." {
+            failures.append("blocked status poll did not surface remediation")
+        }
+        await panel.refreshStatus()
+        model.syncPanelPresentation()
+        if model.banner != nil {
+            failures.append("recovery from blocked did not clear the remediation banner")
+        }
+        model.close()
+        return failures
+    }
+
     private static func settle() async {
         for _ in 0..<8 {
             await Task.yield()
@@ -500,6 +547,14 @@ private actor ChatScriptedTransport: ControlTransport {
         recordedRequests.append(request)
         if fails {
             throw StreamFailure.closed
+        }
+        // Notification polling is an independent verb and must not consume a
+        // history/send/status response scripted for another request.
+        if case .assistantNotificationsList(let id) = request {
+            return .response(.assistantNotificationsList(
+                id: id,
+                payload: AssistantNotificationsListResponsePayload(notifications: [])
+            ))
         }
         if case .chatHistory = request, !historyYields.isEmpty {
             let actions = historyYields.removeFirst()

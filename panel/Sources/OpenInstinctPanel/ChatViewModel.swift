@@ -52,6 +52,10 @@ public final class ChatViewModel: ObservableObject {
     @Published public private(set) var typing = false
     @Published public private(set) var banner: String?
     @Published public private(set) var sending = false
+    @Published public private(set) var pendingNotifications: [AssistantNotification] = []
+    @Published public private(set) var notificationError: String?
+    @Published public private(set) var notificationsLoading = false
+    @Published public private(set) var acknowledgingNotificationIDs = Set<String>()
 
     /// The sequence watermark is intentionally not part of the view surface, but
     /// remains readable by the panel checks to prove reconnect/repair monotonicity.
@@ -76,6 +80,8 @@ public final class ChatViewModel: ObservableObject {
     }
 
     private static let offlineDetail = "Gajae isn't running on this Mac right now. Reinstall it, or wait a moment and check again."
+    private static let notificationLoadError = "알림을 불러오지 못했습니다. 다시 시도해 주세요."
+    private static let notificationAckError = "알림을 확인 처리하지 못했습니다. 다시 시도해 주세요."
 
     private let panel: PanelViewModel
     private let transport: any ControlTransport
@@ -88,6 +94,12 @@ public final class ChatViewModel: ObservableObject {
     private var openState = false
     private var repairTurnId: String?
     private var repairDue = false
+    private var pendingActivitySample: ChatActivitySample?
+    private var activityTask: Task<Void, Never>?
+    private var notificationRefreshPending = false
+    private var acknowledgementRefreshPending = false
+    private var renderedNotificationIDs = Set<String>()
+    private var notificationRenderTasks: [String: Task<Void, Never>] = [:]
 
     public init(panel: PanelViewModel, transport: any ControlTransport = UnixSocketTransport()) {
         self.panel = panel
@@ -106,6 +118,7 @@ public final class ChatViewModel: ObservableObject {
         startStatusPolling()
         syncPanelPresentation()
         await establishConnection()
+        await refreshNotifications()
     }
 
     public func send(_ text: String) async {
@@ -141,6 +154,137 @@ public final class ChatViewModel: ObservableObject {
         }
     }
 
+    private func scheduleNotificationRefresh() {
+        if notificationsLoading {
+            notificationRefreshPending = true
+            return
+        }
+        Task { [weak self] in
+            await self?.refreshNotifications()
+        }
+    }
+
+    public func refreshNotifications() async {
+        guard !notificationsLoading else {
+            notificationRefreshPending = true
+            return
+        }
+        notificationsLoading = true
+        defer {
+            notificationsLoading = false
+            if notificationRefreshPending || acknowledgementRefreshPending {
+                notificationRefreshPending = false
+                acknowledgementRefreshPending = false
+                scheduleNotificationRefresh()
+            }
+        }
+
+        do {
+            let frame = try await transport.request(.assistantNotificationsList(id: requestID()))
+            switch frame {
+            case .response(.assistantNotificationsList(_, let payload)):
+                pendingNotifications = payload.notifications.filter { !$0.acknowledged }
+                notificationError = nil
+            case .error:
+                notificationError = Self.notificationLoadError
+            default:
+                notificationError = Self.notificationLoadError
+            }
+        } catch {
+            notificationError = Self.notificationLoadError
+        }
+    }
+
+    public func acknowledgeNotification(_ notificationID: String) async {
+        guard !notificationID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            notificationError = Self.notificationAckError
+            return
+        }
+        guard !acknowledgingNotificationIDs.contains(notificationID) else { return }
+        acknowledgingNotificationIDs.insert(notificationID)
+        defer { acknowledgingNotificationIDs.remove(notificationID) }
+        acknowledgementRefreshPending = true
+
+        do {
+            let frame = try await transport.request(.assistantNotificationsAck(
+                id: requestID(),
+                payload: AssistantNotificationAckPayload(notificationId: notificationID)
+            ))
+            switch frame {
+            case .response(.assistantNotificationsAck(_, let payload)) where payload.acknowledged:
+                notificationError = nil
+                if notificationsLoading {
+                    notificationRefreshPending = true
+                } else {
+                    acknowledgementRefreshPending = false
+                    await refreshNotifications()
+                }
+            case .error:
+                acknowledgementRefreshPending = false
+                notificationError = Self.notificationAckError
+            default:
+                acknowledgementRefreshPending = false
+                notificationError = Self.notificationAckError
+            }
+        } catch {
+            acknowledgementRefreshPending = false
+            notificationError = Self.notificationAckError
+        }
+    }
+
+    public func reportNotificationRendered(_ notificationID: String) {
+        guard !notificationID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !renderedNotificationIDs.contains(notificationID),
+              notificationRenderTasks[notificationID] == nil else { return }
+        notificationRenderTasks[notificationID] = Task { [weak self] in
+            guard let self else { return }
+            await self.reportNotificationRenderedUntilSuccessful(notificationID)
+        }
+    }
+
+    private func reportNotificationRenderedUntilSuccessful(_ notificationID: String) async {
+        defer { notificationRenderTasks[notificationID] = nil }
+        while openState,
+              pendingNotifications.contains(where: { $0.id == notificationID }),
+              !Task.isCancelled {
+            if await sendNotificationRendered(notificationID) {
+                renderedNotificationIDs.insert(notificationID)
+                return
+            }
+            do {
+                try await Task.sleep(nanoseconds: 5_000_000_000)
+            } catch {
+                return
+            }
+        }
+    }
+
+    private func sendNotificationRendered(_ notificationID: String) async -> Bool {
+        do {
+            let frame = try await transport.request(.assistantNotificationsRendered(
+                id: requestID(),
+                payload: AssistantNotificationRenderedPayload(notificationId: notificationID)
+            ))
+            if case .response(.assistantNotificationsRendered(_, let payload)) = frame {
+                return payload.rendered
+            }
+        } catch {
+            // Retried while the notification row remains visible.
+        }
+        return false
+    }
+
+    /// Coalesces periodic native samples while one socket request is in flight.
+    /// The worker is intentionally independent of the chat subscription lifecycle
+    /// so the final inactive sample can drain after the window closes.
+    public func reportActivity(_ sample: ChatActivitySample) {
+        pendingActivitySample = sample
+        guard activityTask == nil else { return }
+        activityTask = Task { [self] in
+            await drainActivityReports()
+        }
+    }
+
     public func close() {
         openState = false
         loaded = false
@@ -150,6 +294,41 @@ public final class ChatViewModel: ObservableObject {
         reconnectTask?.cancel()
         reconnectTask = nil
         tearDownConnection()
+        for task in notificationRenderTasks.values {
+            task.cancel()
+        }
+        notificationRenderTasks.removeAll()
+    }
+
+    private func drainActivityReports() async {
+        while let sample = pendingActivitySample {
+            pendingActivitySample = nil
+            do {
+                try await sendActivity(sample)
+            } catch {
+                // Activity is best-effort metadata and must not disrupt Chat UI.
+                // A newer queued sample, especially the close sample, still drains.
+            }
+        }
+        activityTask = nil
+    }
+
+    private func sendActivity(_ sample: ChatActivitySample) async throws {
+        let frame = try await transport.request(.chatActivity(
+            id: requestID(),
+            payload: ChatActivityPayload(
+                frontmost: sample.frontmost,
+                lastInputAgeSeconds: sample.lastInputAgeSeconds
+            )
+        ))
+        switch frame {
+        case .response(.chatActivity(_, let payload)) where payload.recorded:
+            return
+        case .error(let error):
+            throw ChatViewModelError.server(error.message)
+        default:
+            throw ChatViewModelError.unexpectedResponse
+        }
     }
 
     private func establishConnection() async {
@@ -367,11 +546,16 @@ public final class ChatViewModel: ObservableObject {
                 guard self.openState, !Task.isCancelled else { return }
                 await self.panel.refreshStatus()
                 self.syncPanelPresentation()
+                await self.refreshNotifications()
             }
         }
     }
 
-    private func syncPanelPresentation() {
+    /// The banner is derived from panel status on every poll so a state
+    /// transition (paused -> running, blocked -> running, absent -> back) clears
+    /// it without reopening the window. Transient send/stream errors set it
+    /// directly and are cleared here on the next healthy poll.
+    func syncPanelPresentation() {
         if panel.connectionState == .absent {
             if banner == nil {
                 banner = Self.offlineDetail
@@ -387,7 +571,7 @@ public final class ChatViewModel: ObservableObject {
         case .starting, .configBlocked, .identityBlocked, .permissionBlocked, .credentialsBlocked, .degraded:
             banner = status.bootstrap.remediation
         case .running:
-            break
+            banner = status.session.paused ? "Paused" : nil
         }
         objectWillChange.send()
     }

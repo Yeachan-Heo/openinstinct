@@ -17,7 +17,19 @@ library="$state_home/lib"
 library_stage="$state_home/lib.new.$$"
 library_previous="$state_home/lib.previous.$$"
 plist="$home_dir/Library/LaunchAgents/co.openinstinct.daemon.plist"
-bun_path=$(command -v bun)
+# OI_BUN pins the runtime (bootstrap-from-payload.sh passes the bundled one);
+# otherwise the first bun on PATH. The lockfile needs the version package.json
+# declares, so refuse anything older instead of failing inside `bun install`.
+bun_path=${OI_BUN:-$(command -v bun || true)}
+[ -n "$bun_path" ] || { printf '%s\n' "bun is required (or run the release installer, which bundles it)" >&2; exit 1; }
+required_bun=$(sed -nE 's/.*"packageManager": *"bun@([0-9.]+)".*/\1/p' "$repo_root/package.json")
+if [ -n "$required_bun" ]; then
+  have_bun=$("$bun_path" --version)
+  if [ "$(printf '%s\n%s\n' "$required_bun" "$have_bun" | sort -V | head -n 1)" != "$required_bun" ]; then
+    printf '%s\n' "bun $have_bun at $bun_path is older than the $required_bun this release needs; install a newer bun or use the release archive, which bundles one" >&2
+    exit 1
+  fi
+fi
 
 cleanup() {
   if [ -n "$library_previous" ] && [ -d "$library_previous" ] && [ ! -e "$library" ]; then
@@ -71,6 +83,32 @@ model_catalog_valid || {
   printf '%s\n' "installed AI package has no valid model catalog; existing daemon was left untouched" >&2
   exit 1
 }
+# The staged tree must at least parse and start. A checkout with unresolved
+# merge markers, or a missing module, would otherwise be copied into lib/ and
+# only fail on the next restart — leaving the daemon down with the panel
+# saying "restarting". Boot it once in a throwaway HOME and require it to
+# still be alive after a few seconds.
+if grep -rlE '^(<<<<<<<|>>>>>>>) ' "$library_stage/daemon/src" >/dev/null 2>&1; then
+  printf '%s\n' "daemon source has unresolved merge conflict markers; existing daemon was left untouched:" >&2
+  grep -rlE '^(<<<<<<<|>>>>>>>) ' "$library_stage/daemon/src" >&2
+  exit 1
+fi
+smoke_home=$(mktemp -d -t oi-smoke)
+mkdir -p "$smoke_home/.openinstinct/logs" "$smoke_home/.openinstinct/run"
+( cd "$library_stage" && HOME="$smoke_home" OI_CONTROL_SOCKET="$smoke_home/.openinstinct/run/control.sock" \
+    "$bun_path" daemon/src/main.ts >"$smoke_home/boot.log" 2>&1 ) &
+smoke_pid=$!
+i=0; while [ "$i" -lt 60 ] && kill -0 "$smoke_pid" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+if kill -0 "$smoke_pid" 2>/dev/null; then
+  kill "$smoke_pid" 2>/dev/null; wait "$smoke_pid" 2>/dev/null || true
+  rm -rf "$smoke_home"
+else
+  wait "$smoke_pid" 2>/dev/null; smoke_rc=$?
+  printf '%s\n' "daemon failed to start from the staged source (exit $smoke_rc); existing daemon was left untouched:" >&2
+  tail -n 15 "$smoke_home/boot.log" >&2
+  rm -rf "$smoke_home"
+  exit 1
+fi
 # Wait (up to ~5 s) for every process matching a pattern to exit. bootout and
 # pkill return before the process is gone; replacing a bundle while its old
 # binary is still mapped is how a "stale" panel or a launchd respawn of the
@@ -123,7 +161,7 @@ if [ -f "$state_home/bin/oi-presence.new" ]; then
 fi
 # `gjc` (vendored) is a `#!/usr/bin/env bun` shim; expose our runtime as `bun`.
 ln -sf "$binary" "$state_home/bin/bun"
-bun "$repo_root/scripts/render-plist.ts" "$home_dir" "$plist"
+"$bun_path" "$repo_root/scripts/render-plist.ts" "$home_dir" "$plist"
 plutil -lint "$plist"
 launchctl bootstrap "gui/$uid" "$plist"
 # macOS 26 defers RunAtLoad/KeepAlive nondemand spawns ("inefficient" heuristic);

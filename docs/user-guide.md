@@ -95,6 +95,133 @@ its schedule or enabled state.
 Long work comes back as "on it" first, then the result. It never uses Markdown,
 never quotes your message back, and replies in whatever language you text in.
 
+### Managed actions and approval commands
+
+For actions that can change local or remote state, Gajae uses a durable managed
+action instead of treating a model decision as permission. Current paths cover:
+
+- writing a regular file or explicitly deleting a file at an absolute path;
+- installing one exact-version Bun package in an absolute work folder, normally
+  with package lifecycle scripts disabled;
+- bounded HTTP GETs and exact POST, PUT, PATCH, or DELETE requests whose host
+  policy allows the endpoint and whose mutation has a separate GET check;
+- raw shell, mutating browser, and otherwise unknown tool effects, gated to the
+  exact tool input.
+
+Monitors and background checks can also record system or third-party evidence as
+a durable observation. Clear, involved unfinished work may become a read-only
+watch; uncertain evidence stays a proposal for review. An observation, website,
+message, or tool result never counts as your approval to change anything.
+
+Before a managed action runs, OpenInstinct records an action ID, revision, and
+digest. File, install, and HTTP paths re-check host state or endpoint policy;
+ordinary local edits and recognized managed-tool installs can run under local
+policy. Deletes, existing user assets, core/account changes, install scripts,
+HTTP mutations, and raw effects require exact owner authority or stay blocked.
+The gate is wired to the actual main and background SDK tool calls, but it is
+cooperative workflow inside the daemon, not an OS sandbox.
+
+When Gajae says explicit approval is required, copy the exact action identity and
+send one standalone, text-only line in Chat or from the configured owner iMessage
+account:
+
+```text
+/approve ACTION_ID REVISION DIGEST
+```
+
+To refuse the current action instead, send:
+
+```text
+/reject ACTION_ID REVISION DIGEST
+```
+
+Do not add words or attachments. `REVISION` is a positive integer and `DIGEST`
+is 64 lowercase hexadecimal characters. OpenInstinct recognizes the managed
+local-file action and validates the stored install, HTTP, and raw-tool payloads
+before accepting approval. A stale or malformed identity is rejected. `/reject`
+cancels the matching revision without executing it. `/approve` records exactly
+one approval; Gajae then runs the matching managed executor with the same
+identity, or retries the exact unchanged raw tool input once. It reports success
+only after the executor verifies it. A raw tool result has no independent check,
+so it is reported as uncertain/ambiguous instead of fake success and is not
+retried blindly.
+
+### Exact send rules and follow-ups
+
+For a managed HTTP action that sends a message, a one-action `/approve` works.
+You can also create a reusable rule for one exact recipient/topic/action tuple:
+
+```text
+/allow-send {"recipient":"…","topic":"…","action":"…"}
+```
+
+Send it as standalone text with no attachment; wildcards and extra fields are
+not allowed. Gajae returns the rule ID and revision;
+revoke future use with:
+
+```text
+/revoke-send RULE_ID REVISION
+```
+
+The rule does not authorize another recipient, topic, action, account, or any
+non-message change.
+
+A bounded follow-up policy repeats an already recorded, confirmed action through
+its real managed executor:
+
+```text
+/followup {"workId":"…","actionId":"…","enabled":true,"intervalMs":60000,"maxAttempts":1}
+```
+Send the `/followup` JSON as one standalone text message with no attachment.
+
+All five fields are required. The command only stores the policy; it does not run
+an action immediately, and a due repeat executes only after the original action
+is confirmed. Each due repeat gets a new action identity, re-checks the original
+revision, authorization, deadline, and attempt cap, and stops on a changed
+policy, rejection, or ambiguous outcome. A sensitive derived action that lacks
+current authority waits for its own exact `/approve`; approval of the original
+is not silently reused. Set `enabled` to `false` to disable the
+policy. After a restart, pre-effect local-file/install/HTTP work can resume
+through the real executor; work interrupted after an effect began is reconciled
+as ambiguous and is never replayed as if nothing happened. These paths are
+wired, but the broader test suite is still being repaired; this is not a claim
+of final full-product verification. Treat a verified executor result—not an
+approval command or queue admission alone—as the completion signal.
+
+### Managed HTTP host configuration
+
+Managed HTTP endpoint and credential access comes from the daemon host, not from
+a prompt or fetched page. `OI_HTTP_LOCAL_ORIGINS` is a JSON array of exact
+`scheme://host[:port]` origins allowed to resolve to private/local addresses.
+`OI_HTTP_SECRET_BINDINGS` maps a tool-visible secret reference to exactly an
+`origin`, `header`, and environment-variable name, for example
+`{"mailApi":{"origin":"https://api.example","header":"Authorization","environment":"MAIL_API_TOKEN"}}`.
+The model supplies only a reference such as `mailApi`; it cannot send a plaintext
+token in a sensitive header, URL query, or body. A binding is used only for its
+exact origin and header. Public plaintext HTTP cannot carry it, redirects are
+not followed, and a mutation is not called
+successful unless the separate verification GET proves the expected state.
+These host variables belong in `~/.openinstinct/env` as `KEY=value` lines; keep
+the file mode 0600. They are operator configuration, not something Gajae can
+create from a conversation.
+
+### Notifications that follow where you are
+
+Some proactive results appear in an **알림** section above the Chat transcript.
+OpenInstinct keeps these notices durably and chooses the first route from recent
+activity: active Chat first, otherwise connected iMessage. If neither is
+available, the notice waits instead of being called delivered.
+
+Seeing a notice and acknowledging it are separate. When a Chat-routed notice
+appears, the panel records that it rendered. A notice first routed to iMessage
+can also appear in shared Chat history and be marked rendered even though it has
+no Chat dispatch row. Press **확인** after you have handled it to acknowledge the
+notice and stop further routing. If a Chat-routed notice was rendered but not
+acknowledged and Chat later becomes inactive, OpenInstinct may fall back to
+iMessage. Queueing an iMessage is not confirmed delivery until the Messages
+ledger has evidence; an uncertain result is reconciled rather than blindly sent
+again.
+
 ### Typing indicator and read receipts (optional)
 
 The typing indicator and read receipts are optional presence features. To use

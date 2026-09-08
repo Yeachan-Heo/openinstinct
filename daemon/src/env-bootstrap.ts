@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { loadEnvFile } from "./env-file.ts";
+import { linkHostModelsYml } from "./gjc-home.ts";
 import { dataPaths } from "./paths.ts";
 
 /** Evaluated before any SDK module; see main.ts. */
@@ -33,4 +34,6 @@ const REQUIRED_SDK_SETTINGS: ReadonlyArray<readonly [string, string]> = [
     text = `${text.replace(/\n*$/, "\n")}${missing.map(([, block]) => block).join("\n")}\n`;
     writeFileSync(file, text, { mode: 0o600 });
   }
+  // Sessions/auth stay isolated; provider config is the owner's and is shared.
+  linkHostModelsYml(paths.gjcHome, join(paths.home, ".gjc", "agent"));
 }

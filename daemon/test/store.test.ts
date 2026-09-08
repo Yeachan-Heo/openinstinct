@@ -94,11 +94,24 @@ function addAbandonedSchema8(path: string, withPendingBatch = false, coldState: 
 }
 
 describe("StateStore migrations", () => {
-  test("migrates an empty database through v8 with conversational child tables", () => {
+  test("migrates an empty database through v9 with action ledger tables", () => {
     const store = openStateStore(stateDbPath());
     try {
-      expect(store.migrationVersions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+      expect(store.migrationVersions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
       expect(store.schemaTables()).toEqual([
+        "assistant_work_action_revisions",
+        "assistant_work_actions",
+        "assistant_work_attempts",
+        "assistant_work_explicit_approvals",
+        "assistant_work_followup_dispatches",
+        "assistant_work_followup_policies",
+        "assistant_work_notification_routes",
+        "assistant_work_notifications",
+        "assistant_work_observations",
+        "assistant_work_owner_rules",
+        "assistant_work_recontacts",
+        "assistant_work_reports",
+        "assistant_work_works",
         "child_interim_batches",
         "child_interim_messages",
         "children",
@@ -122,7 +135,7 @@ describe("StateStore migrations", () => {
 
     const reopened = openStateStore(path);
     try {
-      expect(reopened.migrationVersions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+      expect(reopened.migrationVersions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
     } finally {
       reopened.close();
     }
@@ -147,7 +160,7 @@ describe("StateStore migrations", () => {
 
     const store = openStateStore(path);
     try {
-      expect(store.migrationVersions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+      expect(store.migrationVersions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
       const admitted = store.admitDelivery({
         id: "delivery-v2",
         idempotencyKey: "v2-test",
@@ -210,7 +223,7 @@ describe("StateStore migrations", () => {
 
     const recovered = openStateStore(path);
     try {
-      expect(recovered.migrationVersions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+      expect(recovered.migrationVersions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
       expect(recovered.schemaTables()).toContain("child_interim_batches");
       expect(recovered.schemaTables()).toContain("child_interim_messages");
       expect(recovered.getMeta("repair.sentinel")).toBe("preserved");
@@ -253,7 +266,7 @@ describe("StateStore migrations", () => {
       expect(preserved.query("SELECT state FROM children WHERE id = 'uppercase-cold'").get())
         .toEqual({ state: "COLD" });
       expect(preserved.query("SELECT max(version) AS version FROM schema_migrations").get())
-        .toEqual({ version: 8 });
+        .toEqual({ version: 9 });
       expect(preserved.query(`
         SELECT count(*) AS count
         FROM sqlite_master
@@ -461,7 +474,7 @@ describe("StateStore migrations", () => {
 
     const database = new Database(path);
     database.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
-      .run(9, new Date().toISOString());
+      .run(10, new Date().toISOString());
     database.close();
 
     expect(() => openStateStore(path)).toThrow(SchemaVersionError);

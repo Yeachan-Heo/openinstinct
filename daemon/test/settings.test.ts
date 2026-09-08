@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { dataPaths } from "../src/paths.ts";
-import { SettingsService, type AccountRow, type SettingsPatch } from "../src/settings/service.ts";
+import { MODELS_TTL_MS, SettingsService, type AccountRow, type ModelChoice, type SettingsPatch } from "../src/settings/service.ts";
 
 const dirs: string[] = [];
 afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
@@ -118,6 +118,73 @@ describe("settings service", () => {
     service.invalidate("accounts");
     await service.listAccounts();
     expect(calls).toBe(2);
+  });
+
+  test("model list serves the cache within the TTL and refreshes in the background once stale", async () => {
+    const { service } = make();
+    let calls = 0;
+    const uncached = service as unknown as { listModelsUncached: () => Promise<ModelChoice[]> };
+    uncached.listModelsUncached = async () => {
+      calls += 1;
+      return [{ id: `p/m${calls}`, provider: "p", canonical: `m${calls}` }];
+    };
+    const cache = (service as unknown as { cache: Map<string, { at: number }> }).cache;
+
+    expect((await service.listModels()).map((m) => m.id)).toEqual(["p/m1"]);
+    expect((await service.listModels()).map((m) => m.id)).toEqual(["p/m1"]);
+    expect(calls).toBe(1);
+
+    cache.get("models")!.at = Date.now() - MODELS_TTL_MS - 1;
+    // Stale: the old list is served immediately while a reload runs behind it.
+    expect((await service.listModels()).map((m) => m.id)).toEqual(["p/m1"]);
+    expect(calls).toBe(2);
+    await Bun.sleep(0);
+    expect((await service.listModels()).map((m) => m.id)).toEqual(["p/m2"]);
+    expect(calls).toBe(2);
+  });
+
+  test("forced model refresh bypasses a fresh cache, awaits the new list, and restarts the TTL", async () => {
+    const { service } = make();
+    let calls = 0;
+    const uncached = service as unknown as { listModelsUncached: () => Promise<ModelChoice[]> };
+    uncached.listModelsUncached = async () => {
+      calls += 1;
+      await Bun.sleep(10);
+      return [{ id: `p/m${calls}`, provider: "p", canonical: `m${calls}` }];
+    };
+    const cache = (service as unknown as { cache: Map<string, { at: number }> }).cache;
+
+    await service.listModels();
+    cache.get("models")!.at = Date.now() - 5_000;
+
+    const [forced, passive] = await Promise.all([service.listModels({ refresh: true }), service.listModels()]);
+    expect(forced.map((m) => m.id)).toEqual(["p/m2"]);
+    // A passive caller during a forced reload still gets the instant (old) list.
+    expect(passive.map((m) => m.id)).toEqual(["p/m1"]);
+    expect((await service.listModels()).map((m) => m.id)).toEqual(["p/m2"]);
+    expect(calls).toBe(2);
+    expect(Date.now() - cache.get("models")!.at).toBeLessThan(1_000);
+  });
+
+  test("a failed model load is not cached, so the next caller retries", async () => {
+    const { service } = make();
+    let calls = 0;
+    const uncached = service as unknown as { listModelsUncached: () => Promise<ModelChoice[]> };
+    uncached.listModelsUncached = async () => {
+      calls += 1;
+      if (calls === 1) throw new Error("gjc exploded");
+      return [{ id: "p/m", provider: "p", canonical: "m" }];
+    };
+
+    await expect(service.listModels()).rejects.toThrow("gjc exploded");
+    expect((await service.listModels()).map((m) => m.id)).toEqual(["p/m"]);
+    expect(calls).toBe(2);
+
+    // A failed forced refresh surfaces the error but keeps the last good list.
+    uncached.listModelsUncached = async () => { calls += 1; throw new Error("gjc exploded again"); };
+    await expect(service.listModels({ refresh: true })).rejects.toThrow("gjc exploded again");
+    expect((await service.listModels()).map((m) => m.id)).toEqual(["p/m"]);
+    expect(calls).toBe(3);
   });
 
   test("round-trips child lifetime, interim, status, and tool limits as restart-scoped config", async () => {

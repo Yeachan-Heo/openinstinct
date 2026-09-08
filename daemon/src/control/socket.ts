@@ -17,6 +17,9 @@ import { applyHistoryByteBudget } from "../chat/history.ts";
 import {
   CONTROL_CAPABILITIES,
   CONTROL_VERSION,
+  type AssistantNotificationAckPayload,
+  type AssistantNotificationRenderedPayload,
+  type ChatActivityPayload,
   type ClientFrame,
   type ControlFrame,
   type ErrorCode,
@@ -50,11 +53,17 @@ export interface ControlServerOptions {
   readonly onMonitorRun?: (monitor: MonitorSpec) => Promise<{ readonly dispatched: boolean; readonly reason?: string }>;
   /** Replays owner exchanges from the session transcript into the capture axis. */
   readonly onBackfillCaptures?: () => Promise<JsonObject>;
+  /** Receives validated panel activity metadata; the consumer assigns receipt time. */
+  readonly onChatActivity?: (activity: ChatActivityPayload) => void | Promise<void>;
+  readonly onListAssistantNotifications?: () => JsonObject;
+  readonly onAcknowledgeAssistantNotification?: (id: string) => void | Promise<void>;
+  readonly onAssistantNotificationRendered?: (id: string) => void | Promise<void>;
   /** Settings surface; each returns the response payload. */
   readonly settings?: {
     readonly get: () => Promise<JsonObject>;
     readonly set: (patch: JsonObject) => Promise<JsonObject>;
-    readonly models: () => Promise<JsonObject>;
+    /** `refresh` bypasses the cache and awaits a fresh list. */
+    readonly models: (options: { readonly refresh: boolean }) => Promise<JsonObject>;
     readonly accounts: () => Promise<JsonObject>;
     readonly login: (provider: string) => Promise<JsonObject>;
     readonly logout: (provider: string, account: string) => Promise<JsonObject>;
@@ -303,6 +312,104 @@ export class ControlServer {
           ),
         });
         return;
+      case "chat.activity": {
+        const onChatActivity = this.options.onChatActivity;
+        if (onChatActivity === undefined) {
+          this.send(socket, errorFrame("internal_error", "chat activity reporting is unavailable", request.id));
+          return;
+        }
+        const payload = request.payload as ChatActivityPayload;
+        const activity: ChatActivityPayload = {
+          frontmost: payload.frontmost,
+          lastInputAgeSeconds: payload.lastInputAgeSeconds,
+        };
+        void Promise.resolve()
+          .then(() => onChatActivity(activity))
+          .then(
+            () => this.send(socket, {
+              type: "response",
+              id: request.id,
+              ok: true,
+              payload: { recorded: true },
+            }),
+            (error) => this.send(socket, errorFrame(
+              "internal_error",
+              error instanceof Error ? error.message : "chat activity reporting failed",
+              request.id,
+            )),
+          );
+        return;
+      }
+      case "assistant.notifications.list": {
+        const onListAssistantNotifications = this.options.onListAssistantNotifications;
+        if (onListAssistantNotifications === undefined) {
+          this.send(socket, errorFrame("internal_error", "assistant notifications are unavailable", request.id));
+          return;
+        }
+        try {
+          this.send(socket, {
+            type: "response",
+            id: request.id,
+            ok: true,
+            payload: onListAssistantNotifications(),
+          });
+        } catch (error) {
+          this.send(socket, errorFrame(
+            "internal_error",
+            error instanceof Error ? error.message : "assistant notification listing failed",
+            request.id,
+          ));
+        }
+        return;
+      }
+      case "assistant.notifications.ack": {
+        const onAcknowledgeAssistantNotification = this.options.onAcknowledgeAssistantNotification;
+        if (onAcknowledgeAssistantNotification === undefined) {
+          this.send(socket, errorFrame("internal_error", "assistant notification acknowledgement is unavailable", request.id));
+          return;
+        }
+        const payload = request.payload as AssistantNotificationAckPayload;
+        void Promise.resolve()
+          .then(() => onAcknowledgeAssistantNotification(payload.notificationId))
+          .then(
+            () => this.send(socket, {
+              type: "response",
+              id: request.id,
+              ok: true,
+              payload: { acknowledged: true },
+            }),
+            (error) => this.send(socket, errorFrame(
+              "internal_error",
+              error instanceof Error ? error.message : "assistant notification acknowledgement failed",
+              request.id,
+            )),
+          );
+        return;
+      }
+      case "assistant.notifications.rendered": {
+        const onAssistantNotificationRendered = this.options.onAssistantNotificationRendered;
+        if (onAssistantNotificationRendered === undefined) {
+          this.send(socket, errorFrame("internal_error", "assistant notification rendering is unavailable", request.id));
+          return;
+        }
+        const payload = request.payload as AssistantNotificationRenderedPayload;
+        void Promise.resolve()
+          .then(() => onAssistantNotificationRendered(payload.notificationId))
+          .then(
+            () => this.send(socket, {
+              type: "response",
+              id: request.id,
+              ok: true,
+              payload: { rendered: true },
+            }),
+            (error) => this.send(socket, errorFrame(
+              "internal_error",
+              error instanceof Error ? error.message : "assistant notification rendering failed",
+              request.id,
+            )),
+          );
+        return;
+      }
       case "chat.send": {
         const chat = this.options.chat;
         if (chat === undefined) {
@@ -536,7 +643,7 @@ export class ControlServer {
           switch (request.verb) {
             case "settings.get": return settings.get();
             case "settings.set": return settings.set(p.patch as JsonObject);
-            case "models.list": return settings.models();
+            case "models.list": return settings.models({ refresh: p.refresh === true });
             case "accounts.list": return settings.accounts();
             case "accounts.login": return settings.login(String(p.provider));
             case "accounts.logout": return settings.logout(String(p.provider), String(p.account));

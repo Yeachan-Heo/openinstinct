@@ -27,13 +27,13 @@ import { loadRuntimeBlock } from "../src/persona/soul.ts";
 describe("runtime block", () => {
   test("renders a detached chat-only runtime without unreplaced lane placeholders", () => {
     const block = loadRuntimeBlock({ imessage: "detached", ownerName: "Ada", chromeProfile: "/x/chrome" });
-    expect(block.version).toBe("12");
+    expect(block.version).toBe("14");
     expect(block.text).toContain("The owner is Ada.");
     expect(block.text).toContain("(no iMessage number configured)");
     expect(block.text).toContain("not connected right now");
     expect(block.text).toContain("menu-bar Chat window");
     expect(block.text).toContain("Both owner-facing surfaces render plain text only");
-    expect(block.text).toContain("MainSession and the internal Chat");
+    expect(block.text).toContain("MainSession and the authenticated host routing path");
     expect(block.text).toContain("child_nudge");
     expect(block.text).toContain("never send iMessage directly");
     expect(block.text).not.toContain("{{ownerHandle}}");
@@ -47,7 +47,7 @@ describe("runtime block", () => {
 
   test("renders the configured handle and connected lane state", () => {
     const block = loadRuntimeBlock({ ownerHandle: "+15550001111", imessage: "attached", ownerName: "Ada", chromeProfile: "/x/chrome" });
-    expect(block.version).toBe("12");
+    expect(block.version).toBe("14");
     expect(block.text).toContain("over iMessage at +15550001111");
     expect(block.text).toContain("iMessage is connected");
     expect(block.text).not.toContain("{{");

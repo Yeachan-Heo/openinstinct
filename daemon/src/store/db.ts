@@ -5,6 +5,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
 import { LATEST_SCHEMA_VERSION, MIGRATIONS } from "./migrations.ts";
+import { createAssistantWorkRepository, type AssistantWorkRepository } from "./assistant-work.ts";
 
 export class SchemaVersionError extends Error {
   public constructor(version: number) {
@@ -493,13 +494,18 @@ const DELIVERY_COLUMNS = `
  * Version 4 normalizes child terminal states, adds scheduler priority, receipt content hashes, and orphan recovery.
  * Version 5 adds typed monitor specs, cron fire cursors, staged monitor events, leases, and delivery intent fencing.
  * Version 6 adds durable memory closure intents, commit evidence, and quarantine state.
+ * Version 9 adds the durable assistant-work ledger and atomic pre-effect claims.
  * Callers may only manipulate persisted state through the methods below.
  */
 export class StateStore {
+  public readonly assistantWork: AssistantWorkRepository;
+
   private constructor(
     public readonly path: string,
     private readonly db: Database,
-  ) {}
+  ) {
+    this.assistantWork = createAssistantWorkRepository(db);
+  }
 
   public static open(path: string): StateStore {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
@@ -1385,8 +1391,8 @@ export class StateStore {
        WHERE child_interim_messages.batch_id IS NULL
        ORDER BY child_interim_messages.created_at, child_interim_messages.ROWID`,
     ).all() as InterimMessageRow[]).map(toInterimMessageRecord);
+  }
 
-}
   public listInterimMessages(childId?: string): InterimMessageRecord[] {
     const clause = childId === undefined ? "" : " WHERE child_interim_messages.child_id = ?";
     return (this.db.query(
@@ -2084,7 +2090,7 @@ function ensureMigrationLedger(db: Database): void {
   `);
 }
 
-let currentSchemaFingerprint: readonly string[] | undefined;
+const schemaFingerprintByVersion = new Map<number, readonly string[]>();
 
 function schemaFingerprint(db: Database): readonly string[] {
   return (db.query(`
@@ -2103,62 +2109,77 @@ function normalizeSchemaSql(sql: string): string {
     .trim();
 }
 
-
-function expectedCurrentSchemaFingerprint(): readonly string[] {
-  if (currentSchemaFingerprint !== undefined) {
-    return currentSchemaFingerprint;
+function expectedSchemaFingerprint(version: number): readonly string[] {
+  const cached = schemaFingerprintByVersion.get(version);
+  if (cached !== undefined) {
+    return cached;
   }
+
   const expected = new Database(":memory:");
   try {
     expected.exec("PRAGMA foreign_keys = OFF");
     ensureMigrationLedger(expected);
     for (const migration of MIGRATIONS) {
+      if (migration.version > version) {
+        break;
+      }
       expected.exec(migration.sql);
       expected.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
         .run(migration.version, "1970-01-01T00:00:00.000Z");
     }
-    currentSchemaFingerprint = schemaFingerprint(expected);
-    return currentSchemaFingerprint;
+    const fingerprint = schemaFingerprint(expected);
+    schemaFingerprintByVersion.set(version, fingerprint);
+    return fingerprint;
   } finally {
     expected.close();
   }
 }
 
 /**
- * The former experimental schema 8 is now the released conversational-child
- * schema. When a database claims the current version, validate its complete
- * ledger and exact shape instead of trying to downgrade it.
+ * Validate every claimed contiguous migration prefix before extending it. This
+ * preserves fail-closed schema-8 handling while allowing the additive v9
+ * assistant-work migration to retain all existing conversational-child data.
+ * The caller holds the migration write lock for the complete validation.
  */
-function validateCurrentSchemaIfClaimed(db: Database): void {
-  const appliedRows = db.query("SELECT version FROM schema_migrations ORDER BY version").all() as MigrationRow[];
-  if (!appliedRows.some((row) => row.version === LATEST_SCHEMA_VERSION)) {
-    return;
+function validateClaimedSchemaPrefix(db: Database, appliedRows: readonly MigrationRow[]): void {
+  const newest = appliedRows.at(-1)?.version ?? 0;
+  if (newest > LATEST_SCHEMA_VERSION) {
+    throw new SchemaVersionError(newest);
   }
-  const expectedVersions = MIGRATIONS.map((migration) => migration.version).join(",");
+
+  const expectedVersions = MIGRATIONS.slice(0, appliedRows.length)
+    .map((migration) => migration.version)
+    .join(",");
   const actualVersions = appliedRows.map((row) => row.version).join(",");
-  if (actualVersions !== expectedVersions
-    || schemaFingerprint(db).join("\n") !== expectedCurrentSchemaFingerprint().join("\n")) {
-    throw new SchemaVersionError(LATEST_SCHEMA_VERSION);
+  if (
+    actualVersions !== expectedVersions
+    || schemaFingerprint(db).join("\n") !== expectedSchemaFingerprint(newest).join("\n")
+  ) {
+    throw new SchemaVersionError(newest || LATEST_SCHEMA_VERSION);
   }
 }
 
 function runMigrations(db: Database): void {
-  validateCurrentSchemaIfClaimed(db);
-  const appliedRows = db.query("SELECT version FROM schema_migrations ORDER BY version").all() as MigrationRow[];
-  const applied = new Set(appliedRows.map((row) => row.version));
-  const newest = appliedRows.at(-1)?.version;
-
-  if (newest !== undefined && newest > LATEST_SCHEMA_VERSION) {
-    throw new SchemaVersionError(newest);
-  }
-
-  const pending = MIGRATIONS.filter((migration) => !applied.has(migration.version));
-  const requiresForeignKeysDisabled = pending.some((migration) => migration.requiresForeignKeysDisabled === true);
+  const initialAppliedRows = db.query(
+    "SELECT version FROM schema_migrations ORDER BY version",
+  ).all() as MigrationRow[];
+  const initialApplied = new Set(initialAppliedRows.map((row) => row.version));
+  const initialPending = MIGRATIONS.filter((migration) => !initialApplied.has(migration.version));
+  const requiresForeignKeysDisabled = initialPending.some(
+    (migration) => migration.requiresForeignKeysDisabled === true,
+  );
   if (requiresForeignKeysDisabled) {
     db.exec("PRAGMA foreign_keys = OFF");
   }
+
   db.exec("BEGIN IMMEDIATE");
   try {
+    const appliedRows = db.query(
+      "SELECT version FROM schema_migrations ORDER BY version",
+    ).all() as MigrationRow[];
+    validateClaimedSchemaPrefix(db, appliedRows);
+    const applied = new Set(appliedRows.map((row) => row.version));
+    const pending = MIGRATIONS.filter((migration) => !applied.has(migration.version));
     for (const migration of pending) {
       db.exec(migration.sql);
       db.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")

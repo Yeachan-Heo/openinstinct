@@ -1,0 +1,8 @@
+{
+  "type": "request",
+  "id": "models-2",
+  "verb": "models.list",
+  "payload": {
+    "refresh": true
+  }
+}

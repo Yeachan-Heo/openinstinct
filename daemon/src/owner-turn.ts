@@ -13,6 +13,23 @@ import { toPlainText } from "./delivery/plaintext.ts";
 import { ChatHub, type ChatMessage, type OwnerSource } from "./chat/hub.ts";
 import { applyHistoryByteBudget, mergeOwnerHistory, readOwnerFacingHistory, stripOrientation, stripPanelMarker } from "./chat/history.ts";
 
+import { MANAGED_LOCAL_FILE_ACTION } from "./assistant-work/local-effects.ts";
+import { MANAGED_INSTALL_ACTION, parseManagedInstallPlan } from "./assistant-work/install.ts";
+import { isManagedHttpActionRecord } from "./assistant-work/http-effects.ts";
+import { isManagedOpaqueToolAction } from "./assistant-work/tool-gate.ts";
+import {
+  applyOwnerFollowupCommand,
+  applyOwnerSendRuleCommand,
+  ownerFollowupCommandResultText,
+  ownerSendRuleCommandResultText,
+  parseOwnerFollowupCommand,
+  parseOwnerSendRuleCommand,
+  type OwnerFollowupCommand,
+  type OwnerFollowupCommandParseResult,
+  type OwnerSendRuleCommand,
+  type OwnerSendRuleCommandParseResult,
+} from "./assistant-work/owner-policy.ts";
+import { stableOwnerRuleId, type ActionRecord, type EvidenceProvenance } from "./assistant-work/model.ts";
 import type { NdjsonLogger } from "./log.ts";
 import type { MemoryClosureQueue } from "./memory/adapters/intents.ts";
 import {
@@ -40,7 +57,50 @@ export interface OwnerTurnRequest {
   readonly replyToGuid?: string;
 }
 
-export type AdmitOutcome = "started" | "steered" | "suppressed_paused" | "no_active_lane";
+export type AdmitOutcome = "started" | "steered" | "command" | "suppressed_paused" | "no_active_lane";
+
+export type OwnerActionCommand = {
+  readonly operation: "approve" | "reject";
+  readonly actionId: string;
+  readonly revision: number;
+  readonly digest: string;
+};
+
+export type OwnerActionCommandParseResult =
+  | { readonly kind: "valid"; readonly command: OwnerActionCommand }
+  | { readonly kind: "invalid"; readonly message: string };
+
+type OwnerHostCommandOperation = OwnerActionCommand["operation"] | OwnerSendRuleCommand["operation"] | OwnerFollowupCommand["operation"] | "invalid";
+
+const OWNER_ACTION_COMMAND_USAGE = "Use exactly /approve ACTION_ID REVISION DIGEST or /reject ACTION_ID REVISION DIGEST. Approval execution is available only for managed local-file, managed-install, and managed-HTTP actions.";
+
+/** Recognizes only exact standalone commands; ordinary text is never authority. */
+export function parseOwnerActionCommand(text: string): OwnerActionCommandParseResult | undefined {
+  const trimmed = text.trim();
+  if (!/^\/(?:approve|reject)(?:\s|$)/.test(trimmed)) {
+    return undefined;
+  }
+  const match = /^\/(approve|reject)\s+(\S+)\s+([1-9]\d*)\s+([a-f0-9]{64})$/.exec(trimmed);
+  if (!match) {
+    return { kind: "invalid", message: OWNER_ACTION_COMMAND_USAGE };
+  }
+  const revision = Number(match[3]);
+  if (match[2]!.length > 512 || match[2]!.includes("\0")) {
+    return { kind: "invalid", message: OWNER_ACTION_COMMAND_USAGE };
+  }
+  if (!Number.isSafeInteger(revision)) {
+    return { kind: "invalid", message: OWNER_ACTION_COMMAND_USAGE };
+  }
+  return {
+    kind: "valid",
+    command: {
+      operation: match[1] as OwnerActionCommand["operation"],
+      actionId: match[2]!,
+      revision,
+      digest: match[4]!,
+    },
+  };
+}
 
 interface OwnerChatEvent extends ChatEvent {
   readonly topic: "chat.message";
@@ -133,6 +193,29 @@ export class OwnerTurnIngress {
       });
       return "suppressed_paused";
     }
+    const actionCommand = parseOwnerActionCommand(request.text);
+    const sendRuleCommand = parseOwnerSendRuleCommand(request.text);
+    const followupCommand = parseOwnerFollowupCommand(request.text);
+    const command = actionCommand ?? sendRuleCommand ?? followupCommand;
+    const commandHasAttachments = command !== undefined && (
+      (request.images !== undefined && request.images.length > 0)
+      || stripPanelMarker(request.promptText).text.trim() !== request.text.trim()
+    );
+    if (commandHasAttachments) {
+      return this.completeOwnerActionCommand(request, "Owner authority commands must be sent as standalone text without attachments or quoted content.", options, {
+        operation: "invalid",
+        applied: false,
+      });
+    }
+    if (actionCommand !== undefined) {
+      return this.handleOwnerActionCommand(request, actionCommand, options);
+    }
+    if (sendRuleCommand !== undefined) {
+      return this.handleOwnerSendRuleCommand(request, sendRuleCommand, options);
+    }
+    if (followupCommand !== undefined) {
+      return this.handleOwnerFollowupCommand(request, followupCommand, options);
+    }
 
     const lane = this.deps.lanes();
     if (lane === undefined) {
@@ -143,62 +226,7 @@ export class OwnerTurnIngress {
       return "no_active_lane";
     }
 
-    const echo = this.emitMessage({
-      role: "owner",
-      source: request.source,
-      text: request.text,
-      turnId: request.turnId,
-    });
-    const admission: Admission = {
-      turnId: request.turnId,
-      request,
-      sources: new Set([request.source]),
-      steered: [],
-      events: [echo],
-      firstSeq: echo.payload.seq,
-    };
-    this.admissions.set(request.turnId, admission);
-    this.laneByAdmission.set(request.turnId, lane);
-    void this.presence.typing(request.source, true, request.turnId).catch(() => undefined);
-
-    const turnInput = ownerTurnInput(request);
-    const session = lane.session;
-
-    // A queued owner box is the strongest ownership signal: the SDK will add
-    // this row to that box and consume it in the same run later.
-    const queued = this.queued;
-    let queuedSteerAttempted = false;
-    if (queued !== undefined) {
-      queuedSteerAttempted = true;
-      const outcome = await this.trySteer(session, turnInput);
-      if (outcome.kind === "admitted" && this.mergeIntoAdmission(queued, request.turnId)) {
-        this.preMerged.add(request.turnId);
-        return "steered";
-      }
-    }
-
-    // `running` also covers a continuation arm which has not opened a run yet.
-    // The SDK, rather than this wrapper, decides whether the row is consumed by
-    // the live run or by its scheduled continuation.
-    if (!queuedSteerAttempted && (this.activeContext !== undefined || session.running)) {
-      const outcome = await this.trySteer(session, turnInput);
-      if (outcome.kind === "admitted") {
-        return "steered";
-      }
-    }
-
-    // Set this before invoking either presence or session code. A second
-    // same-tick admission must see this owner box and use the branch above.
-    this.queued = request.turnId;
-    if (options.markRead !== false) {
-      void this.presence.read(request.source, request.turnId).catch(() => undefined);
-    }
-    this.deps.logger.write("info", "sdk_session", "turn_started", {
-      turnId: request.turnId,
-      source: request.source,
-    });
-    void session.turn(turnInput);
-    return "started";
+    return this.admitToLane(request, lane, options);
   }
 
   public onTurnStarted(active: ActiveTurn): void {
@@ -400,6 +428,332 @@ export class OwnerTurnIngress {
 
   public get current(): TurnContext | undefined {
     return this.activeContext;
+  }
+
+  private async admitToLane(
+    request: OwnerTurnRequest,
+    lane: OwnerLane,
+    options: { readonly markRead?: boolean },
+  ): Promise<AdmitOutcome> {
+    const echo = this.emitMessage({
+      role: "owner",
+      source: request.source,
+      text: request.text,
+      turnId: request.turnId,
+    });
+    const admission: Admission = {
+      turnId: request.turnId,
+      request,
+      sources: new Set([request.source]),
+      steered: [],
+      events: [echo],
+      firstSeq: echo.payload.seq,
+    };
+    this.admissions.set(request.turnId, admission);
+    this.laneByAdmission.set(request.turnId, lane);
+    void this.presence.typing(request.source, true, request.turnId).catch(() => undefined);
+
+    const turnInput = ownerTurnInput(request);
+    const session = lane.session;
+    const queued = this.queued;
+    let queuedSteerAttempted = false;
+    if (queued !== undefined) {
+      queuedSteerAttempted = true;
+      const outcome = await this.trySteer(session, turnInput);
+      if (outcome.kind === "admitted" && this.mergeIntoAdmission(queued, request.turnId)) {
+        this.preMerged.add(request.turnId);
+        return "steered";
+      }
+    }
+    if (!queuedSteerAttempted && (this.activeContext !== undefined || session.running)) {
+      const outcome = await this.trySteer(session, turnInput);
+      if (outcome.kind === "admitted") {
+        return "steered";
+      }
+    }
+
+    this.queued = request.turnId;
+    if (options.markRead !== false) {
+      void this.presence.read(request.source, request.turnId).catch(() => undefined);
+    }
+    this.deps.logger.write("info", "sdk_session", "turn_started", {
+      turnId: request.turnId,
+      source: request.source,
+    });
+    void session.turn(turnInput);
+    return "started";
+  }
+
+  private async handleOwnerFollowupCommand(
+    request: OwnerTurnRequest,
+    parsed: OwnerFollowupCommandParseResult,
+    options: { readonly markRead?: boolean },
+  ): Promise<AdmitOutcome> {
+    if (parsed.kind === "invalid") {
+      return this.completeOwnerActionCommand(request, parsed.message, options, {
+        operation: parsed.operation,
+        applied: false,
+      });
+    }
+    const command = parsed.command;
+    try {
+      const policy = applyOwnerFollowupCommand({
+        repository: this.deps.store.assistantWork,
+        command,
+        provenance: ownerCommandProvenance(request, this.deps.outbox.handle),
+        now: new Date().toISOString(),
+      });
+      return this.completeOwnerActionCommand(
+        request,
+        ownerFollowupCommandResultText(policy),
+        options,
+        {
+          operation: command.operation,
+          applied: true,
+          workId: policy.workId,
+          actionId: policy.actionId,
+          revision: policy.revision,
+        },
+      );
+    } catch (error) {
+      return this.completeOwnerActionCommand(
+        request,
+        `Command was not applied: ${commandErrorMessage(error)}`,
+        options,
+        {
+          operation: command.operation,
+          applied: false,
+          workId: command.policy.workId,
+          actionId: command.policy.actionId,
+        },
+      );
+    }
+  }
+
+  private async handleOwnerSendRuleCommand(
+    request: OwnerTurnRequest,
+    parsed: OwnerSendRuleCommandParseResult,
+    options: { readonly markRead?: boolean },
+  ): Promise<AdmitOutcome> {
+    if (parsed.kind === "invalid") {
+      return this.completeOwnerActionCommand(request, parsed.message, options, {
+        operation: parsed.operation,
+        applied: false,
+      });
+    }
+    const command = parsed.command;
+    const existingRule = command.operation === "allow_send"
+      ? this.deps.store.assistantWork.getOwnerRule(stableOwnerRuleId(command.matcher))
+      : this.deps.store.assistantWork.getOwnerRule(command.ruleId);
+    try {
+      const rule = applyOwnerSendRuleCommand({
+        repository: this.deps.store.assistantWork,
+        command,
+        provenance: ownerCommandProvenance(request, this.deps.outbox.handle),
+        now: new Date().toISOString(),
+      });
+      return this.completeOwnerActionCommand(
+        request,
+        ownerSendRuleCommandResultText(command, rule, {
+          changed: existingRule?.revision !== rule.revision || existingRule?.state !== rule.state,
+        }),
+        options,
+        {
+          operation: command.operation,
+          applied: true,
+          ruleId: rule.id,
+          revision: rule.revision,
+        },
+      );
+    } catch (error) {
+      return this.completeOwnerActionCommand(
+        request,
+        `Command was not applied: ${commandErrorMessage(error)}`,
+        options,
+        {
+          operation: command.operation,
+          applied: false,
+          ...(command.operation === "revoke_send" ? { ruleId: command.ruleId, revision: command.revision } : {}),
+        },
+      );
+    }
+  }
+
+  private async handleOwnerActionCommand(
+    request: OwnerTurnRequest,
+    parsed: OwnerActionCommandParseResult,
+    options: { readonly markRead?: boolean },
+  ): Promise<AdmitOutcome> {
+    if (parsed.kind === "invalid") {
+      return this.completeOwnerActionCommand(request, parsed.message, options, {
+        operation: "invalid",
+        applied: false,
+      });
+    }
+
+    const command = parsed.command;
+    const provenance = ownerCommandProvenance(request, this.deps.outbox.handle);
+    let current: ActionRecord | undefined;
+    try {
+      current = this.deps.store.assistantWork.getAction(command.actionId);
+    } catch (error) {
+      return this.completeOwnerActionCommand(
+        request,
+        `Command was not applied: ${commandErrorMessage(error)}`,
+        options,
+        { operation: command.operation, applied: false, actionId: command.actionId, revision: command.revision },
+      );
+    }
+    if (current === undefined) {
+      return this.completeOwnerActionCommand(
+        request,
+        `No assistant action exists with ID ${command.actionId}. No command was applied.`,
+        options,
+        { operation: command.operation, applied: false, actionId: command.actionId, revision: command.revision },
+      );
+    }
+    if (current.revision !== command.revision || current.digest !== command.digest) {
+      return this.completeOwnerActionCommand(
+        request,
+        `Command rejected as stale. Current action ${current.id} is revision ${current.revision} digest ${current.digest} in state ${current.state}.`,
+        options,
+        { operation: command.operation, applied: false, actionId: command.actionId, revision: command.revision },
+      );
+    }
+    if (command.operation === "approve" && !supportsManagedApproval(current)) {
+      return this.completeOwnerActionCommand(
+        request,
+        `Action ${command.actionId} uses unsupported executor ${current.action}. No approval or effect was applied.`,
+        options,
+        { operation: command.operation, applied: false, actionId: command.actionId, revision: command.revision },
+      );
+    }
+
+    if (command.operation === "reject") {
+      try {
+        this.deps.store.assistantWork.cancelAction({
+          actionId: command.actionId,
+          revision: command.revision,
+          digest: command.digest,
+          reason: `authenticated owner rejection (${provenance.evidenceId})`,
+        }, new Date().toISOString());
+      } catch (error) {
+        return this.completeOwnerActionCommand(
+          request,
+          `Command was not applied: ${commandErrorMessage(error)}`,
+          options,
+          { operation: command.operation, applied: false, actionId: command.actionId, revision: command.revision },
+        );
+      }
+      return this.completeOwnerActionCommand(
+        request,
+        `Rejected and cancelled action ${command.actionId} revision ${command.revision} digest ${command.digest}. It was not executed by this command.`,
+        options,
+        { operation: command.operation, applied: true, actionId: command.actionId, revision: command.revision },
+      );
+    }
+    const lane = this.deps.lanes();
+    if (lane === undefined) {
+      return this.completeOwnerActionCommand(
+        request,
+        `Action ${command.actionId} was not approved or executed because the assistant session is unavailable.`,
+        options,
+        { operation: command.operation, applied: false, actionId: command.actionId, revision: command.revision },
+      );
+    }
+
+    try {
+      this.deps.store.assistantWork.grantExplicitApproval({
+        actionId: command.actionId,
+        revision: command.revision,
+        digest: command.digest,
+        provenance,
+      }, new Date().toISOString());
+    } catch (error) {
+      return this.completeOwnerActionCommand(
+        request,
+        `Command was not applied: ${commandErrorMessage(error)}`,
+        options,
+        { operation: command.operation, applied: false, actionId: command.actionId, revision: command.revision },
+      );
+    }
+
+    this.logOwnerActionCommand(request, {
+      operation: command.operation,
+      applied: true,
+      actionId: command.actionId,
+      revision: command.revision,
+    });
+    return this.admitToLane(request, lane, options);
+  }
+
+  private async completeOwnerActionCommand(
+    request: OwnerTurnRequest,
+    reply: string,
+    options: { readonly markRead?: boolean },
+    fields: {
+      readonly operation: OwnerHostCommandOperation;
+      readonly applied: boolean;
+      readonly workId?: string;
+      readonly actionId?: string;
+      readonly ruleId?: string;
+      readonly revision?: number;
+    },
+  ): Promise<AdmitOutcome> {
+    this.emitMessage({
+      role: "owner",
+      source: request.source,
+      text: request.text,
+      turnId: request.turnId,
+    });
+    if (options.markRead !== false) {
+      void this.presence.read(request.source, request.turnId).catch(() => undefined);
+    }
+    try {
+      const binding = this.deps.outbox.bind(request.turnId);
+      binding.admit(this.ownerOutboundForRequest(request, {
+        idempotencyKey: `owner-command:${request.turnId}`,
+        text: reply,
+      }));
+    } catch (error) {
+      this.deps.logger.write("warn", "assistant_work", "owner_action_command_delivery_failed", {
+        turnId: request.turnId,
+        source: request.source,
+        message: commandErrorMessage(error),
+      });
+    }
+    this.emitMessage({
+      role: "assistant",
+      text: toPlainText(reply),
+      turnId: request.turnId,
+      final: true,
+    });
+    this.logOwnerActionCommand(request, fields);
+    return "command";
+  }
+
+  private logOwnerActionCommand(
+    request: OwnerTurnRequest,
+    fields: {
+      readonly operation: OwnerHostCommandOperation;
+      readonly applied: boolean;
+      readonly workId?: string;
+      readonly actionId?: string;
+      readonly ruleId?: string;
+      readonly revision?: number;
+    },
+  ): void {
+    this.deps.logger.write(fields.applied ? "info" : "warn", "assistant_work", "owner_action_command", {
+      turnId: request.turnId,
+      source: request.source,
+      ...fields,
+    });
+  }
+
+  private ownerOutboundForRequest(request: OwnerTurnRequest, outbound: OwnerOutbound): OwnerOutbound {
+    return request.replyToGuid === undefined
+      ? outbound
+      : { ...outbound, replyToGuid: request.replyToGuid };
   }
 
   private async trySteer(session: MainSession, input: MainTurnInput): Promise<SteerOutcome> {
@@ -722,6 +1076,7 @@ function ownerTurnInput(request: OwnerTurnRequest): MainTurnInput {
   };
 }
 
+
 function transcriptUserText(content: unknown): string | undefined {
   if (typeof content === "string") {
     return content;
@@ -756,7 +1111,36 @@ function deliveredSegmentText(events: readonly ChatEvent[]): string {
   }
   return parts.join("\n");
 }
+
 function memoryDigest(text: string): string {
   const compact = text.replace(/\s+/g, " ").trim();
   return Array.from(compact).slice(0, 500).join("");
+}
+
+function ownerCommandProvenance(request: OwnerTurnRequest, ownerHandle: string | undefined): EvidenceProvenance {
+  return {
+    principal: "owner",
+    channel: `owner_${request.source}`,
+    subject: request.source === "imessage"
+      ? ownerHandle ?? "authenticated-owner"
+      : "authenticated-local-owner",
+    evidenceId: `owner-command:${request.source}:${request.turnId}`,
+  };
+}
+
+function supportsManagedApproval(action: ActionRecord): boolean {
+  if (action.action === MANAGED_LOCAL_FILE_ACTION) return true;
+  if (isManagedHttpActionRecord(action)) return true;
+  if (isManagedOpaqueToolAction(action)) return true;
+  if (action.action !== MANAGED_INSTALL_ACTION) return false;
+  try {
+    parseManagedInstallPlan(action.payload);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function commandErrorMessage(error: unknown): string {
+  return Array.from(error instanceof Error ? error.message : String(error)).slice(0, 500).join("");
 }

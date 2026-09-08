@@ -121,6 +121,20 @@ final class SettingsModel: ObservableObject {
         }
     }
 
+    /// `refresh` makes the daemon re-run `gjc --list-models` instead of serving its cache.
+    func loadModels(refresh: Bool = false) async {
+        if refresh { busy = true }
+        defer { if refresh { busy = false } }
+        do {
+            let frame = try await req(.modelsList(id: id(), payload: ModelsListPayload(refresh: refresh)))
+            if case .response(.modelsList(_, let r)) = frame {
+                models = r.models
+            }
+        } catch {
+            message = "Gajae isn't running, so settings can't load yet."
+        }
+    }
+
     func loadDiscovered() async {
         busy = true; defer { busy = false }
         do {
@@ -142,8 +156,9 @@ final class SettingsModel: ObservableObject {
             switch frame {
             case .response(.accountsAdopt(_, let r)):
                 message = r.restarting
-                    ? "Using your existing sign-in. Gajae is restarting to apply it (a few seconds)."
+                    ? "Using your existing sign-in. Gajae is restarting to apply it…"
                     : "Using your existing sign-in."
+                if r.restarting { await awaitRestart(then: "Using your existing sign-in.") }
                 await loadAccounts()
             case .error(let e): message = e.message
             default: message = "Unexpected reply."
@@ -157,12 +172,51 @@ final class SettingsModel: ObservableObject {
             let frame = try await req(.settingsSet(id: id(), payload: SettingsSetPayload(patch: patch)))
             switch frame {
             case .response(.settingsSet(_, let r)):
-                message = r.restarting ? "Saved. Gajae is restarting to apply it (a few seconds)." : "Saved."
-                if !r.restarting { await load() }
+                message = r.restarting ? "Saved. Gajae is restarting to apply it…" : "Saved."
+                if r.restarting { await awaitRestart(then: "Saved and applied.") } else { await load() }
             case .error(let e): message = e.message
             default: message = "Unexpected reply."
             }
         } catch { message = error.localizedDescription }
+    }
+
+    /// A `restarting: true` reply means the daemon will exit and launchd should
+    /// bring it back. Wait for that cycle (down, then up) with a deadline; if it
+    /// never comes back, kickstart it once and say what happened. Without this
+    /// the window sat on "restarting…" forever when the relaunch failed.
+    private func awaitRestart(then success: String) async {
+        let deadline = Date().addingTimeInterval(20)
+        var wentDown = false
+        while Date() < deadline {
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            if let state = await probeState() {
+                if wentDown && state == "running" {
+                    message = success
+                    await load()
+                    return
+                }
+            } else {
+                wentDown = true
+            }
+        }
+        message = "Gajae did not come back on its own; starting it again…"
+        try? await PanelViewModel.kickstartDaemon()
+        for _ in 0..<25 {
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            if await probeState() == "running" {
+                message = success
+                await load()
+                return
+            }
+        }
+        message = "Gajae could not restart. Quick actions → Show log files, then open launchd.stderr.log for the reason."
+    }
+
+    /// Bootstrap state when the control socket answers, nil when it does not.
+    private func probeState() async -> String? {
+        guard let frame = try? await req(.statusGet(id: id())),
+              case .response(.status(_, let status)) = frame else { return nil }
+        return status.bootstrap.state.rawValue
     }
 
     func startLogin(provider: String) async {
@@ -260,6 +314,9 @@ struct SettingsRootView: View {
         }
         .frame(minWidth: 560, minHeight: 480)
         .task { await settings.load() }
+        .onChange(of: model.modelsRefreshedAt) { _ in
+            Task { await settings.loadModels() }
+        }
     }
 }
 
@@ -377,6 +434,14 @@ private struct AccountTab: View {
                         Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
                         TextField("Search models (e.g. sonnet, gpt-5, grok)", text: $s.modelQuery)
                             .textFieldStyle(.roundedBorder)
+                        Button {
+                            Task { await s.loadModels(refresh: true) }
+                        } label: {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                        .buttonStyle(.borderless)
+                        .disabled(s.busy)
+                        .help("Reload the model list from gjc")
                     }
                     let filtered = s.filteredModels
                     List(selection: $s.selectedModel) {

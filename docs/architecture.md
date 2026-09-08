@@ -13,7 +13,7 @@ under `~/.openinstinct`. No root, SIP on, no third-party binaries other than `gj
   config.json            optional owner handle, name, model, limits
 
   env                    provider keys (0600), loaded before any SDK import
-  state.db               SQLite: cursor, deliveries, children, monitors, receipts
+  state.db               SQLite: cursors, deliveries, children, monitors, receipts, assistant work, notifications
   session/               cwd of the main SDK session (never the repo)
   children/{work,sessions,journal}/
   memory/                git repo, gajae-way layout
@@ -141,11 +141,170 @@ It is never respawned per message.
   character, versioned) → `persona/RUNTIME.md` (where it is: iMessage, plain
   text, delegation rules, monitor rules, Chrome profile; `{{ownerHandle}}` etc.
   substituted from config).
-- **Custom tools**: `delegate_background`, `send_image`, `monitor_author`,
-  `memory_search`, `memory_capture`, `memory_audit`.
+- **Custom tools**: `delegate_background`, `send_image`, `child_nudge`,
+  `child_status`, `monitor_author`, `memory_search`, `memory_capture`,
+  `memory_audit`, `assistant_work_observe`, `assistant_service_monitor`,
+  `assistant_local_file`, `assistant_work_status`, `assistant_managed_install`,
+  and `assistant_managed_http`. Task/conversational children receive the managed
+  local-file tool; monitor children receive observation and read-only
+  service-monitor tools. The managed raw-effect gate wraps the actual main and
+  child SDK extension lifecycles.
 - **Extensions**: `browser/enforce.ts` blocks any `browser` tool call not
   pinned to the dedicated Chrome profile and returns the exact `app` block to
   retry with.
+
+## Assistant work and managed effects
+
+`assistant-work/` and `store/assistant-work.ts` implement a durable ledger for
+work items, observations, canonical action revisions, approvals, attempts, and
+owner notifications. `assistant_work_observe` accepts only `system` or
+`third_party` provenance. A host-side assessment decides whether evidence is
+irrelevant, an uncertain proposal, or clear unfinished work worth tracking;
+the observation itself never authorizes an effect. `assistant_service_monitor`
+can turn the clear case into a service-neutral read-only monitor at a 5-minute
+cadence for important/ongoing work or 45 minutes otherwise. Its read-only rule
+is cooperative policy, not OS-level confinement.
+
+The registered managed paths are:
+
+- `assistant_local_file` proposes or executes regular-file writes and explicit
+  deletes at normalized absolute paths. Host preflight inventories the targets
+  and derives the effect class; the model cannot label its own action safe.
+- `assistant_managed_install` proposes or executes one exact-version Bun
+  package in an absolute work directory. The host owns the Bun path and argv,
+  defaults to lifecycle scripts disabled, and inventories the destination
+  before and after the one spawn.
+- `assistant_managed_http` performs a bounded GET or proposes/executes one exact
+  POST, PUT, PATCH, or DELETE request. Mutations run once without redirects or
+  automatic retry, then a separate GET verifies the expected remote state.
+- `assistant_work_status` reads work, action, revision/digest, and attempt state;
+  it cannot approve or dispatch anything.
+
+The SDK-level managed tool gate also intercepts raw `bash`, mutating browser
+calls, and unknown tool effects in both main and child sessions. Raw file
+writes/edits are redirected to `assistant_local_file`. Where managed execution
+is available, other raw effects are bound to the exact tool name and canonical
+input digest, require exact owner approval, persist `effect_started` before the
+SDK invokes them once, and settle as `ambiguous` because a tool result is
+execution evidence, not independent verification. Observation-only monitor
+children fail closed instead. This is a cooperative gate over actual SDK calls,
+not an OS sandbox or fake-success wrapper.
+
+Every proposal is identified by an action ID, positive revision, and canonical
+SHA-256 digest. Execution must present that exact triple. The executor
+re-inspects host state before claim and again before mutation, persists
+`effect_started` before invoking the effect, and settles with verified evidence.
+An ambiguous post-effect result is reconcile-only: it is not blindly retried.
+Ordinary local edits and a recognized dedicated managed install root can use
+local policy. Deletes, existing-user-asset changes, core/account changes,
+lifecycle scripts, managed HTTP mutations, and opaque raw effects require exact
+owner authority or remain blocked. A managed HTTP action marked as an external
+message may instead use a currently enabled owner rule whose recipient, topic,
+and action all match exactly.
+
+Owner authority is minted only in `OwnerTurnIngress`, after the local Chat socket
+or configured iMessage allowlist authenticates the direct owner message. Action
+approval/rejection commands are exact, standalone, text-only lines:
+
+```text
+/approve ACTION_ID REVISION DIGEST
+/reject ACTION_ID REVISION DIGEST
+```
+
+The digest is 64 lowercase hexadecimal characters. Attachments, extra words,
+unknown actions, and stale revisions/digests are rejected. `supportsManagedApproval`
+recognizes the managed local-file action and validates the persisted payload for
+managed-install, managed-HTTP, and managed opaque-tool records. Ordinary
+conversation and content copied from a
+website, message, monitor, child, memory, or tool are never approval. `/reject`
+cancels the matching current revision without running it. `/approve` records
+one exact approval and hands the direct owner command to MainSession; the model
+must call the matching managed executor with that same ID/revision/digest, or
+retry the exact unchanged raw tool input once. Completion still comes only from
+the durable executor result.
+
+External-message rules use separate exact, standalone, text-only commands:
+
+```text
+/allow-send {"recipient":"…","topic":"…","action":"…"}
+/revoke-send RULE_ID REVISION
+```
+
+The JSON accepts exactly those three non-wildcard fields. A rule authorizes only
+that recipient/topic/action tuple, never another account or effect; revocation
+is revision-fenced and prevents future claims. Non-message HTTP mutations and
+all opaque raw effects still require action-specific `/approve`.
+
+### Follow-up policies and recovery
+
+The authenticated owner can bind a bounded repeat policy to an already confirmed
+action with another standalone, text-only command:
+
+```text
+/followup {"workId":"…","actionId":"…","enabled":true,"intervalMs":60000,"maxAttempts":1}
+```
+
+All five fields are required and extra fields are rejected. The policy captures
+the action's current revision and digest, schedules nothing when disabled or
+`maxAttempts` is zero, and never treats the command itself as a dispatch. Due
+execution proceeds only after the original action is confirmed. The runtime
+polls enabled policies, creates a new semantic action for each ordinal, rechecks
+current authorization/deadline/work state, enforces the attempt cap, and uses
+the real local-file/install/HTTP executor selected from the persisted
+action payload. A changed policy or action stops the old path; an ambiguous or
+rejected outcome stops further repeats, while approval-required work remains due
+until that exact derived action is authorized.
+
+`AssistantWorkRuntime` also recovers on boot. A `claimed_pre_effect` attempt for
+a supported local-file/install/HTTP action may resume through its real executor.
+An interrupted `effect_started` attempt is marked reconcile-only/ambiguous and
+is never replayed. Durable recovery reports
+are passed through an internal MainSession turn before an owner notice is
+admitted; no fabricated success is emitted. Completion requires a verified executor
+result and surface-specific acceptance evidence, not merely a saved policy or
+queue admission.
+
+### Managed HTTP host policy
+
+The managed HTTP tool is registered from `main.ts` with `configuredHttpAccess()`.
+`OI_HTTP_LOCAL_ORIGINS` is a JSON array of exact `scheme://host[:port]` origins
+and is the only way to allow private/local addresses; cloud metadata endpoints
+remain blocked. `OI_HTTP_SECRET_BINDINGS` is a JSON object whose host-owned
+entries contain exactly `origin`, `header`, and `environment`, for example
+`{"mailApi":{"origin":"https://api.example","header":"Authorization","environment":"MAIL_API_TOKEN"}}`.
+Tool calls carry a `secretRef` such as `mailApi`, never the secret value. The
+daemon snapshots the named environment value and resolves it only when both the
+exact origin and header match. Sensitive
+headers, query parameters, and body keys cannot contain plaintext credentials.
+Public plaintext HTTP cannot carry secret references, redirects are not
+followed, DNS answers are validated and pinned for the connection, and an
+unverified post-mutation result is `ambiguous`, not success.
+Host operators place these values in the daemon's private `~/.openinstinct/env`
+file (`KEY=value`, mode 0600); prompt content cannot edit the host policy.
+
+### Adaptive owner notifications
+
+Main-authored proactive notices are admitted under a stable ID, not treated as
+delivered on creation. `ChatActivity` considers Chat active only when a fresh
+sample says the window is frontmost and recent input is within two minutes. An
+active Chat gets the initial route; otherwise an attached iMessage lane is used.
+If neither route is available, the durable notice waits.
+
+When Chat is the selected route, listing is not delivery: the route stays
+`uncertain` until the panel confirms that the notice rendered. An iMessage-first
+notice can also appear in shared Chat history and record `renderedAt` without a
+Chat dispatch row. Render is still not owner acknowledgement: an unacknowledged
+Chat-routed notice may fall back to iMessage after Chat becomes inactive. The
+owner presses **확인** to acknowledge it and stop further routing. Likewise,
+iMessage queue admission is not confirmation: that route remains `uncertain`
+until the delivery ledger confirms the Messages row. Interrupted dispatches are
+recovered as reconcile-only work, so uncertainty never triggers a blind resend.
+
+The control surface is `assistant.notifications.list` (`{}`),
+`assistant.notifications.rendered` (`{notificationId}`), and
+`assistant.notifications.ack` (`{notificationId}`). Listing returns durable
+`{id, text, acknowledged}` rows; the panel filters acknowledged rows from its
+visible notice list.
 
 ## Outbound: ChatHub and optional iMessage delivery
 
@@ -158,16 +317,19 @@ trailing `[sent from the Chat window]` marker. History returns a sequence
 watermark and message-only tail so a subscriber can merge the snapshot with
 live events without losing or duplicating rows.
 
-`OwnerOutbox` is the single owner-bound delivery boundary. With the optional
-iMessage lane attached it pins the current handle and delegates text and images to
-the durable `DeliveryService` ledger, while read receipts and typing use the
-attached Messages presence path. When detached, owner-turn output still reaches
-ChatHub, while iMessage admission and presence are skipped and proactive notices
-are dropped with a log entry. A per-turn binding captures the lane generation: a
-turn that started detached never starts mirroring if the lane attaches mid-turn,
-and a turn invalidated by detach drops its remaining iMessage effects. Receipt,
-monitor, memory-audit, and operator-note output normally bypasses ChatHub; if an
-owner message promotes an internal run, only output from that promotion onward is
+`OwnerOutbox` is the single owner-bound iMessage boundary. With the optional
+lane attached it pins the current handle and delegates owner-turn text and
+images to the durable `DeliveryService` ledger, while read receipts and typing
+use the attached Messages presence path. When detached, owner-turn output still
+reaches ChatHub and direct iMessage admission/presence is skipped. Main-authored
+proactive output instead enters the durable assistant-notification ledger: it
+can render in active Chat, route to confirmed iMessage delivery, or wait without
+being misreported as delivered. A per-turn binding captures the lane generation:
+a turn that started detached never starts mirroring if the lane attaches
+mid-turn, and a turn invalidated by detach drops its remaining iMessage effects.
+Receipt, monitor, memory-audit, and operator-note output normally bypasses the
+conversation bubble stream and uses the notification path; if an owner message
+promotes an internal run, only output from that promotion onward is
 owner-visible.
 
 `delivery/service.ts` is the durable outbox in `state.db`: `admit()` writes a row
@@ -263,9 +425,13 @@ copies them into the Swift test target so the panel codec is byte-checked
 against them. Notable verbs: `status.get` (bootstrap, session, children,
 monitors, `attention`), `monitors.*` including `monitors.run`,
 `daemon.pause/resume/restart`, `session.compact/reload`, `settings.get/set`,
-`models.list`, `accounts.*`, `providers.custom` (writes a provider block into
-`~/.gjc/agent/models.yml`), `browser.open`, and `memory.backfillCaptures`.
-OAuth account login uses `gjc auth-broker login`, with a paste-code fallback.
+`models.list` (cached 10 min; `{"refresh": true}` re-runs `gjc --list-models`
+and restarts the TTL — the panel's reload button sends this), `accounts.*`,
+`providers.custom` (writes a provider block into `~/.gjc/agent/models.yml`),
+`browser.open`, and `memory.backfillCaptures`. Chat activity and durable notices
+use `chat.activity`, `assistant.notifications.list`,
+`assistant.notifications.rendered`, and `assistant.notifications.ack`. OAuth
+account login uses `gjc auth-broker login`, with a paste-code fallback.
 
 `accounts.discover` lists existing Claude, ChatGPT/Codex CLI credentials that can
 be adopted; `accounts.adopt` changes the daemon's selected credential only after
@@ -297,6 +463,13 @@ missing, or the session is paused — never because the optional iMessage lane i
 detached. `SettingsWindow.swift` is a normal window with tabs, including an
 iMessage tab for connect/disconnect and permission status; changing the handle
 does not restart the daemon.
+
+The Chat window also polls durable assistant notifications. Visible notices are
+rendered above the transcript with **확인** acknowledgement controls; as a row
+appears, the panel retries `rendered` until the daemon accepts it, while pressing
+the button reports `ack`. `ChatActivityReporter` samples frontmost/recent-input
+metadata every 5 seconds for adaptive Chat-versus-iMessage routing. It reads
+elapsed input age only and does not install an event tap or inspect keystrokes.
 
 The Account tab also lists OAuth/API-key accounts, offers explicit discovery and
 **Adopt** for existing CLI credentials, and never adopts one without owner action.
@@ -338,3 +511,8 @@ approval prompt.
   advised).
 - iMessage-bound effects use durable, idempotent delivery rows; Chat hub events are
   fire-and-forget and sequenced.
+- System/third-party observations can propose or schedule read-only discovery,
+  but cannot mint owner provenance or authorize a mutation.
+- Managed effects use host classification, exact revision/digest fencing, and
+  verification; they are cooperative gates inside the daemon, not a claim that
+  the whole process is a hard sandbox.

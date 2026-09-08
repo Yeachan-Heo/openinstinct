@@ -28,12 +28,12 @@ struct MenuBarView: View {
                         .font(.headline)
                     Spacer()
                     Button {
-                        Task { await model.refresh() }
+                        Task { await model.reload() }
                     } label: {
                         Image(systemName: "arrow.clockwise")
                     }
                     .buttonStyle(.borderless)
-                    .help("Check again")
+                    .help("Check again and reload the model list")
                 }
 
                 if bootstrapNeedsSetup {
@@ -82,8 +82,17 @@ struct MenuBarView: View {
         }
         .frame(minWidth: 400, minHeight: 380)
         .task {
+            // Poll while the popover is open so a pause/resume or lane change
+            // made elsewhere (Chat, iMessage, another panel action) is
+            // reflected without closing and reopening. `.task` is cancelled
+            // when the popover closes, which ends the loop.
             await model.refresh()
             await updates.checkIfDue()
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                guard !Task.isCancelled else { return }
+                await model.refresh()
+            }
         }
     }
 }

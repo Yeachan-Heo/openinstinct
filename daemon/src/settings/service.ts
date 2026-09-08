@@ -42,6 +42,14 @@ export const MANAGED_CREDENTIAL_ENV_KEYS: readonly string[] = MANAGED_ENV_KEYS.f
 );
 export const OI_API_KEY_PATTERN = /^OI_[A-Z0-9_]+_API_KEY$/;
 export const MANAGED_OI_API_KEY_PATTERN = OI_API_KEY_PATTERN;
+/** `gjc --list-models` is slow (~seconds); serve it cached and refresh in the background once it is this old. */
+export const MODELS_TTL_MS = 10 * 60_000;
+
+interface CacheEntry {
+  at: number;
+  value: unknown;
+  inflight?: Promise<unknown>;
+}
 
 export interface SettingsSnapshot {
   readonly ownerHandle: string;
@@ -439,8 +447,9 @@ export class SettingsService {
 
   /**
    * Registers a custom OpenAI/Anthropic-compatible endpoint as a gjc provider
-   * in ~/.gjc/agent/models.yml, stores its key in the env file, and selects
-   * `<id>/<model>` as the main model. Mirrors how gjc itself models gateways.
+   * in models.yml (the isolated gjc home's copy is a symlink to the host's
+   * ~/.gjc/agent/models.yml, so the write lands there), stores its key in the
+   * env file, and selects `<id>/<model>` as the main model.
    */
   public async addCustomProvider(input: { readonly id: string; readonly baseUrl: string; readonly api: "openai-responses" | "openai-completions" | "anthropic-messages"; readonly apiKey: string; readonly model: string }): Promise<{ readonly modelId: string }> {
     const id = input.id.trim().toLowerCase();
@@ -481,24 +490,37 @@ export class SettingsService {
     return { modelId };
   }
 
-  private cache = new Map<string, { at: number; value: unknown; inflight?: Promise<unknown> }>();
+  private cache = new Map<string, CacheEntry>();
 
-  /** Serve the last result instantly and refresh in the background when stale. */
-  private cached<T>(key: string, ttlMs: number, load: () => Promise<T>): Promise<T> {
+  /**
+   * Serve the last result instantly and refresh in the background once it is
+   * older than `ttlMs`. `force` drops the cached value and awaits a fresh load;
+   * callers arriving while that load is in flight share its result. A failed
+   * load never poisons the key: first-load failures are evicted so the next
+   * caller retries, and background-refresh failures keep serving the last good
+   * value until the next attempt.
+   */
+  private cached<T>(key: string, ttlMs: number, load: () => Promise<T>, force = false): Promise<T> {
     const entry = this.cache.get(key);
-    if (entry?.at === 0 && entry.inflight) {
+    if (entry === undefined) {
+      const record: CacheEntry = { at: 0, value: undefined };
+      record.inflight = load().then(
+        (value) => { record.at = Date.now(); record.value = value; record.inflight = undefined; return value; },
+        (error: unknown) => { if (this.cache.get(key) === record) this.cache.delete(key); throw error; },
+      );
+      this.cache.set(key, record);
+      return record.inflight as Promise<T>;
+    }
+    if (entry.inflight === undefined && (force || Date.now() - entry.at >= ttlMs)) {
+      entry.inflight = load()
+        .then((value) => { entry.at = Date.now(); entry.value = value; return value; })
+        .finally(() => { entry.inflight = undefined; });
+      if (!force) entry.inflight.catch(() => undefined);
+    }
+    if (entry.inflight !== undefined && (force || entry.at === 0)) {
       return entry.inflight as Promise<T>;
     }
-    const fresh = entry !== undefined && Date.now() - entry.at < ttlMs;
-    if (entry && !entry.inflight && !fresh) {
-      entry.inflight = load().then((value) => { this.cache.set(key, { at: Date.now(), value }); return value; }).catch(() => entry.value);
-    }
-    if (entry) {
-      return Promise.resolve(entry.value as T);
-    }
-    const inflight = load().then((value) => { this.cache.set(key, { at: Date.now(), value }); return value; });
-    this.cache.set(key, { at: 0, value: undefined, inflight });
-    return inflight;
+    return Promise.resolve(entry.value as T);
   }
 
   /** Warm the slow gjc-backed lists so the panel opens instantly. */
@@ -508,8 +530,8 @@ export class SettingsService {
     void this.listAccounts().catch(() => undefined);
   }
 
-  public listModels(): Promise<ModelChoice[]> {
-    return this.cached("models", 10 * 60_000, () => this.listModelsUncached());
+  public listModels(options: { readonly refresh?: boolean } = {}): Promise<ModelChoice[]> {
+    return this.cached("models", MODELS_TTL_MS, () => this.listModelsUncached(), options.refresh === true);
   }
 
   public listAccounts(): Promise<AccountRow[]> {

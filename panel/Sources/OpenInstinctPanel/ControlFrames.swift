@@ -23,6 +23,10 @@ public enum ControlCapability: String, Codable, Sendable, Equatable {
     case chatSend = "chat.send"
     case chatHistory = "chat.history"
     case chatSubscribe = "chat.subscribe"
+    case chatActivity = "chat.activity"
+    case assistantNotificationsList = "assistant.notifications.list"
+    case assistantNotificationsAck = "assistant.notifications.ack"
+    case assistantNotificationsRendered = "assistant.notifications.rendered"
     case settingsGet = "settings.get"
     case settingsSet = "settings.set"
     case modelsList = "models.list"
@@ -210,6 +214,22 @@ public struct SettingsSetPayload: Codable, Sendable, Equatable {
     public let patch: [String: JSONValue]
     public init(patch: [String: JSONValue]) { self.patch = patch }
 }
+/// `refresh` is omitted on the wire when false so the request stays byte-identical to the historical `{}` payload.
+public struct ModelsListPayload: Codable, Sendable, Equatable {
+    public let refresh: Bool
+    public init(refresh: Bool = false) { self.refresh = refresh }
+    private enum CodingKeys: String, CodingKey { case refresh }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        refresh = try container.decodeIfPresent(Bool.self, forKey: .refresh) ?? false
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        if refresh { try container.encode(true, forKey: .refresh) }
+    }
+}
 public struct AccountsLoginPayload: Codable, Sendable, Equatable {
     public let provider: String
     public init(provider: String) { self.provider = provider }
@@ -237,6 +257,109 @@ public struct ChatHistoryPayload: Codable, Sendable, Equatable {
 
     public init(limit: Int) {
         self.limit = limit
+    }
+}
+
+public struct ChatActivityPayload: Codable, Sendable, Equatable {
+    public let frontmost: Bool
+    public let lastInputAgeSeconds: Double?
+
+    public init(frontmost: Bool, lastInputAgeSeconds: Double?) {
+        self.frontmost = frontmost
+        self.lastInputAgeSeconds = lastInputAgeSeconds
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case frontmost
+        case lastInputAgeSeconds
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        frontmost = try container.decode(Bool.self, forKey: .frontmost)
+        guard container.contains(.lastInputAgeSeconds) else {
+            throw ControlCodecError.invalidFrame("chat.activity.lastInputAgeSeconds must be a nonnegative finite number or null")
+        }
+        if try container.decodeNil(forKey: .lastInputAgeSeconds) {
+            lastInputAgeSeconds = nil
+            return
+        }
+        let age = try container.decode(Double.self, forKey: .lastInputAgeSeconds)
+        guard age.isFinite, age >= 0 else {
+            throw ControlCodecError.invalidFrame("chat.activity.lastInputAgeSeconds must be a nonnegative finite number or null")
+        }
+        lastInputAgeSeconds = age
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        if let lastInputAgeSeconds, !lastInputAgeSeconds.isFinite || lastInputAgeSeconds < 0 {
+            throw ControlCodecError.invalidFrame("chat.activity.lastInputAgeSeconds must be a nonnegative finite number or null")
+        }
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(frontmost, forKey: .frontmost)
+        if let lastInputAgeSeconds {
+            try container.encode(lastInputAgeSeconds, forKey: .lastInputAgeSeconds)
+        } else {
+            try container.encodeNil(forKey: .lastInputAgeSeconds)
+        }
+    }
+}
+
+public struct AssistantNotificationAckPayload: Codable, Sendable, Equatable {
+    public let notificationId: String
+
+    public init(notificationId: String) {
+        self.notificationId = notificationId
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let object = try container.decode([String: String].self)
+        guard object.count == 1, let notificationId = object["notificationId"], !notificationId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw ControlCodecError.invalidFrame("assistant.notifications.ack.notificationId must be a non-empty string")
+        }
+        self.notificationId = notificationId
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        guard !notificationId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw ControlCodecError.invalidFrame("assistant.notifications.ack.notificationId must be a non-empty string")
+        }
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(notificationId, forKey: .notificationId)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case notificationId
+    }
+}
+
+public struct AssistantNotificationRenderedPayload: Codable, Sendable, Equatable {
+    public let notificationId: String
+
+    public init(notificationId: String) {
+        self.notificationId = notificationId
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let object = try container.decode([String: String].self)
+        guard object.count == 1, let notificationId = object["notificationId"], !notificationId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw ControlCodecError.invalidFrame("assistant.notifications.rendered.notificationId must be a non-empty string")
+        }
+        self.notificationId = notificationId
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        guard !notificationId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw ControlCodecError.invalidFrame("assistant.notifications.rendered.notificationId must be a non-empty string")
+        }
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(notificationId, forKey: .notificationId)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case notificationId
     }
 }
 public struct AccountsLoginFinishPayload: Codable, Sendable, Equatable {
@@ -279,9 +402,13 @@ public enum ControlRequest: Codable, Sendable, Equatable {
     case chatSend(id: String, payload: ChatSendPayload)
     case chatHistory(id: String, payload: ChatHistoryPayload)
     case chatSubscribe(id: String)
+    case chatActivity(id: String, payload: ChatActivityPayload)
+    case assistantNotificationsList(id: String)
+    case assistantNotificationsAck(id: String, payload: AssistantNotificationAckPayload)
+    case assistantNotificationsRendered(id: String, payload: AssistantNotificationRenderedPayload)
     case settingsGet(id: String)
     case settingsSet(id: String, payload: SettingsSetPayload)
-    case modelsList(id: String)
+    case modelsList(id: String, payload: ModelsListPayload = ModelsListPayload())
     case accountsList(id: String)
     case accountsLogin(id: String, payload: AccountsLoginPayload)
     case accountsLogout(id: String, payload: AccountsLogoutPayload)
@@ -297,11 +424,13 @@ public enum ControlRequest: Codable, Sendable, Equatable {
         switch self {
         case .statusGet(let id), .monitorsList(let id), .daemonPause(let id), .daemonResume(let id), .maintenanceRun(let id), .memoryBackfillCaptures(let id), .sessionReload(let id), .sessionReset(let id):
             return id
-        case .settingsGet(let id), .modelsList(let id), .accountsList(let id), .daemonRestart(let id), .browserOpen(let id), .accountsProviders(let id):
+        case .settingsGet(let id), .modelsList(let id, _), .accountsList(let id), .daemonRestart(let id), .browserOpen(let id), .accountsProviders(let id):
             return id
         case .accountsDiscover(let id):
             return id
-        case .settingsSet(let id, _), .accountsLogin(let id, _), .accountsLogout(let id, _), .accountsLoginFinish(let id, _), .providersCustom(let id, _), .sessionNotify(let id, _), .chatSend(let id, _), .chatHistory(let id, _), .chatSubscribe(let id):
+        case .settingsSet(let id, _), .accountsLogin(let id, _), .accountsLogout(let id, _), .accountsLoginFinish(let id, _), .providersCustom(let id, _), .sessionNotify(let id, _), .chatSend(let id, _), .chatHistory(let id, _), .chatActivity(let id, _), .assistantNotificationsAck(let id, _), .assistantNotificationsRendered(let id, _), .chatSubscribe(let id):
+            return id
+        case .assistantNotificationsList(let id):
             return id
         case .accountsAdopt(let id, _):
             return id
@@ -329,6 +458,10 @@ public enum ControlRequest: Codable, Sendable, Equatable {
         case .chatSend: return .chatSend
         case .chatHistory: return .chatHistory
         case .chatSubscribe: return .chatSubscribe
+        case .chatActivity: return .chatActivity
+        case .assistantNotificationsList: return .assistantNotificationsList
+        case .assistantNotificationsAck: return .assistantNotificationsAck
+        case .assistantNotificationsRendered: return .assistantNotificationsRendered
         case .settingsGet: return .settingsGet
         case .settingsSet: return .settingsSet
         case .modelsList: return .modelsList
@@ -396,14 +529,22 @@ public enum ControlRequest: Codable, Sendable, Equatable {
         case .chatSubscribe:
             _ = try container.decode(EmptyPayload.self, forKey: .payload)
             self = .chatSubscribe(id: id)
+        case .chatActivity:
+            self = .chatActivity(id: id, payload: try container.decode(ChatActivityPayload.self, forKey: .payload))
+        case .assistantNotificationsList:
+            _ = try container.decode(EmptyPayload.self, forKey: .payload)
+            self = .assistantNotificationsList(id: id)
+        case .assistantNotificationsAck:
+            self = .assistantNotificationsAck(id: id, payload: try container.decode(AssistantNotificationAckPayload.self, forKey: .payload))
+        case .assistantNotificationsRendered:
+            self = .assistantNotificationsRendered(id: id, payload: try container.decode(AssistantNotificationRenderedPayload.self, forKey: .payload))
         case .settingsGet:
             _ = try container.decode(EmptyPayload.self, forKey: .payload)
             self = .settingsGet(id: id)
         case .settingsSet:
             self = .settingsSet(id: id, payload: try container.decode(SettingsSetPayload.self, forKey: .payload))
         case .modelsList:
-            _ = try container.decode(EmptyPayload.self, forKey: .payload)
-            self = .modelsList(id: id)
+            self = .modelsList(id: id, payload: try container.decode(ModelsListPayload.self, forKey: .payload))
         case .accountsList:
             _ = try container.decode(EmptyPayload.self, forKey: .payload)
             self = .accountsList(id: id)
@@ -451,8 +592,10 @@ public enum ControlRequest: Codable, Sendable, Equatable {
         try container.encode(id, forKey: .id)
         try container.encode(capability, forKey: .verb)
         switch self {
-        case .statusGet, .monitorsList, .daemonPause, .daemonResume, .maintenanceRun, .memoryBackfillCaptures, .sessionReload, .sessionReset, .settingsGet, .modelsList, .accountsList, .daemonRestart, .browserOpen, .accountsProviders, .chatSubscribe:
+        case .statusGet, .monitorsList, .daemonPause, .daemonResume, .maintenanceRun, .memoryBackfillCaptures, .sessionReload, .sessionReset, .settingsGet, .accountsList, .daemonRestart, .browserOpen, .accountsProviders, .chatSubscribe, .assistantNotificationsList:
             try container.encode(EmptyPayload(), forKey: .payload)
+        case .modelsList(_, let payload):
+            try container.encode(payload, forKey: .payload)
         case .accountsDiscover:
             try container.encode(EmptyPayload(), forKey: .payload)
         case .accountsAdopt(_, let payload):
@@ -464,6 +607,12 @@ public enum ControlRequest: Codable, Sendable, Equatable {
         case .chatSend(_, let payload):
             try container.encode(payload, forKey: .payload)
         case .chatHistory(_, let payload):
+            try container.encode(payload, forKey: .payload)
+        case .chatActivity(_, let payload):
+            try container.encode(payload, forKey: .payload)
+        case .assistantNotificationsAck(_, let payload):
+            try container.encode(payload, forKey: .payload)
+        case .assistantNotificationsRendered(_, let payload):
             try container.encode(payload, forKey: .payload)
         case .settingsSet(_, let payload):
             try container.encode(payload, forKey: .payload)
@@ -1284,6 +1433,77 @@ public struct ChatSubscribeResponsePayload: Codable, Sendable, Equatable {
     }
 }
 
+public struct ChatActivityResponsePayload: Codable, Sendable, Equatable {
+    public let recorded: Bool
+
+    public init(recorded: Bool) {
+        self.recorded = recorded
+    }
+}
+
+public struct AssistantNotification: Codable, Sendable, Equatable, Identifiable {
+    public let id: String
+    public let text: String
+    public let acknowledged: Bool
+
+    public init(id: String, text: String, acknowledged: Bool) {
+        self.id = id
+        self.text = text
+        self.acknowledged = acknowledged
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let id = try container.decode(String.self, forKey: .id)
+        guard !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw ControlCodecError.invalidFrame("assistant notification id must be a non-empty string")
+        }
+        self.id = id
+        text = try container.decode(String.self, forKey: .text)
+        acknowledged = try container.decode(Bool.self, forKey: .acknowledged)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        guard !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw ControlCodecError.invalidFrame("assistant notification id must be a non-empty string")
+        }
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(text, forKey: .text)
+        try container.encode(acknowledged, forKey: .acknowledged)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case text
+        case acknowledged
+    }
+}
+
+public struct AssistantNotificationsListResponsePayload: Codable, Sendable, Equatable {
+    public let notifications: [AssistantNotification]
+
+    public init(notifications: [AssistantNotification]) {
+        self.notifications = notifications
+    }
+}
+
+public struct AssistantNotificationAckResponsePayload: Codable, Sendable, Equatable {
+    public let acknowledged: Bool
+
+    public init(acknowledged: Bool) {
+        self.acknowledged = acknowledged
+    }
+}
+
+public struct AssistantNotificationRenderedResponsePayload: Codable, Sendable, Equatable {
+    public let rendered: Bool
+
+    public init(rendered: Bool) {
+        self.rendered = rendered
+    }
+}
+
 public enum ControlResponse: Codable, Sendable, Equatable {
     case status(id: String, payload: StatusResponsePayload)
     case monitorsList(id: String, payload: MonitorsListResponsePayload)
@@ -1301,6 +1521,10 @@ public enum ControlResponse: Codable, Sendable, Equatable {
     case chatSend(id: String, payload: ChatSendResponsePayload)
     case chatHistory(id: String, payload: ChatHistoryResponsePayload)
     case chatSubscribe(id: String, payload: ChatSubscribeResponsePayload)
+    case chatActivity(id: String, payload: ChatActivityResponsePayload)
+    case assistantNotificationsList(id: String, payload: AssistantNotificationsListResponsePayload)
+    case assistantNotificationsAck(id: String, payload: AssistantNotificationAckResponsePayload)
+    case assistantNotificationsRendered(id: String, payload: AssistantNotificationRenderedResponsePayload)
     case settingsGet(id: String, payload: SettingsSnapshotPayload)
     case settingsSet(id: String, payload: SettingsSetResponsePayload)
     case modelsList(id: String, payload: ModelsListResponsePayload)
@@ -1318,7 +1542,7 @@ public enum ControlResponse: Codable, Sendable, Equatable {
         switch self {
         case .status(let id, _), .monitorsList(let id, _), .monitorsToggle(let id, _), .monitorsRun(let id, _), .monitorsDelete(let id, _), .daemonPause(let id, _):
             return id
-        case .sessionCompactAccepted(let id, _), .sessionCompactStatus(let id, _), .maintenanceRun(let id, _), .memoryBackfillCaptures(let id, _), .sessionReload(let id, _), .sessionReset(let id, _), .sessionNotify(let id, _), .chatSend(let id, _), .chatHistory(let id, _), .chatSubscribe(let id, _):
+        case .sessionCompactAccepted(let id, _), .sessionCompactStatus(let id, _), .maintenanceRun(let id, _), .memoryBackfillCaptures(let id, _), .sessionReload(let id, _), .sessionReset(let id, _), .sessionNotify(let id, _), .chatSend(let id, _), .chatHistory(let id, _), .chatSubscribe(let id, _), .chatActivity(let id, _), .assistantNotificationsList(let id, _), .assistantNotificationsAck(let id, _), .assistantNotificationsRendered(let id, _):
             return id
         case .settingsGet(let id, _), .settingsSet(let id, _), .modelsList(let id, _), .accountsList(let id, _), .accountsLogin(let id, _), .ok(let id, _), .daemonRestart(let id, _), .browserOpen(let id, _), .accountsProviders(let id, _), .providersCustom(let id, _):
             return id
@@ -1378,6 +1602,14 @@ public enum ControlResponse: Codable, Sendable, Equatable {
             self = .chatHistory(id: id, payload: payload)
         } else if let payload = try? container.decode(ChatSubscribeResponsePayload.self, forKey: .payload) {
             self = .chatSubscribe(id: id, payload: payload)
+        } else if let payload = try? container.decode(ChatActivityResponsePayload.self, forKey: .payload) {
+            self = .chatActivity(id: id, payload: payload)
+        } else if let payload = try? container.decode(AssistantNotificationsListResponsePayload.self, forKey: .payload) {
+            self = .assistantNotificationsList(id: id, payload: payload)
+        } else if let payload = try? container.decode(AssistantNotificationAckResponsePayload.self, forKey: .payload) {
+            self = .assistantNotificationsAck(id: id, payload: payload)
+        } else if let payload = try? container.decode(AssistantNotificationRenderedResponsePayload.self, forKey: .payload) {
+            self = .assistantNotificationsRendered(id: id, payload: payload)
         } else if let payload = try? container.decode(OkResponsePayload.self, forKey: .payload), (try? container.decode(SessionReloadResponsePayload.self, forKey: .payload)) == nil {
             self = .ok(id: id, payload: payload)
         } else if let payload = try? container.decode(DaemonPauseResponsePayload.self, forKey: .payload) {
@@ -1426,6 +1658,10 @@ public enum ControlResponse: Codable, Sendable, Equatable {
         case .chatSend(_, let payload): try container.encode(payload, forKey: .payload)
         case .chatHistory(_, let payload): try container.encode(payload, forKey: .payload)
         case .chatSubscribe(_, let payload): try container.encode(payload, forKey: .payload)
+        case .chatActivity(_, let payload): try container.encode(payload, forKey: .payload)
+        case .assistantNotificationsList(_, let payload): try container.encode(payload, forKey: .payload)
+        case .assistantNotificationsAck(_, let payload): try container.encode(payload, forKey: .payload)
+        case .assistantNotificationsRendered(_, let payload): try container.encode(payload, forKey: .payload)
         case .settingsGet(_, let payload): try container.encode(payload, forKey: .payload)
         case .settingsSet(_, let payload): try container.encode(payload, forKey: .payload)
         case .modelsList(_, let payload): try container.encode(payload, forKey: .payload)

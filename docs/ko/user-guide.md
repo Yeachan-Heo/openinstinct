@@ -59,6 +59,69 @@ Chat 창에 입력하거나, 선택적 iMessage 레인이 연결된 뒤 폰에�
 
 오래 걸리는 일은 "하는 중" 먼저, 결과는 나중에. 마크다운을 쓰지 않고, 내 문자를 인용하지 않고, 내가 쓰는 언어로 답합니다.
 
+### 관리형 액션과 정확한 승인
+
+로컬이나 원격 상태를 바꿀 수 있는 일은 모델의 판단을 권한으로 삼지 않고 내구성 있는 관리형 액션으로 처리합니다. 현재 경로는 다음을 다룹니다.
+
+- 절대 경로의 일반 파일 쓰기 또는 명시적 파일 삭제
+- 절대 작업 폴더에 정확한 버전의 Bun 패키지 하나 설치(기본적으로 lifecycle script 비활성)
+- 호스트 정책이 허용한 HTTP GET과, 별도 GET 검증이 붙은 정확한 POST/PUT/PATCH/DELETE
+- 정확한 툴 입력에 묶인 raw shell, 변경형 browser, 알 수 없는 툴 부작용
+
+모니터와 백그라운드 점검은 system/third-party 근거를 내구성 있는 관찰로 남길 수 있습니다. 명확하고 관련 있는 미완료 작업만 읽기 전용 감시가 될 수 있고, 불확실한 근거는 검토용 제안으로 남습니다. 관찰, 웹페이지, 메시지, 툴 결과는 변경 승인으로 취급되지 않습니다.
+
+실행 전 OpenInstinct는 액션 ID, 리비전, digest를 기록합니다. 파일·설치·HTTP 경로는 호스트 상태나 endpoint 정책을 다시 확인합니다. 일반 로컬 편집과 확인된 관리형 툴 설치는 로컬 정책으로 실행할 수 있지만, 기존 파일/사용자 자산 변경, 코어·계정 변경, 설치 script, HTTP 변경, raw 부작용에는 정확한 소유자 권한이 필요합니다. 이 gate는 실제 메인/백그라운드 SDK 툴 호출에 연결되어 있지만 OS sandbox는 아닙니다.
+
+가재가 명시적 승인을 요구하면 알려준 액션 identity를 그대로 복사해 Chat 또는 설정된 소유자 iMessage 계정에서 첨부 없이 한 줄로 보냅니다.
+
+```text
+/approve ACTION_ID REVISION DIGEST
+```
+
+거절하려면:
+
+```text
+/reject ACTION_ID REVISION DIGEST
+```
+
+`REVISION`은 양의 정수, `DIGEST`는 소문자 16진수 64자입니다. OpenInstinct는 관리형 local-file 액션을 식별하고 install/HTTP/raw-tool payload 구조를 검증합니다. 낡거나 형식이 다른 identity는 거부합니다. `/reject`는 해당 리비전을 실행하지 않고 취소합니다. `/approve`는 정확한 승인 하나를 기록하고, 가재는 같은 identity로 알맞은 관리형 executor를 실행하거나 동일한 raw 툴 입력을 한 번만 다시 시도합니다. executor가 검증하기 전에는 성공으로 말하지 않습니다. raw 툴 결과는 독립 검증이 없으므로 가짜 성공 대신 `ambiguous`로 기록하고 맹목적으로 재시도하지 않습니다.
+
+### 정확한 발신 규칙과 후속 실행
+
+관리형 HTTP로 외부 메시지를 보낼 때는 액션별 `/approve`를 쓸 수 있습니다. 특정 recipient/topic/action 조합을 앞으로도 허용하려면:
+
+```text
+/allow-send {"recipient":"…","topic":"…","action":"…"}
+```
+
+첨부 없이 한 줄의 독립된 텍스트로 보내야 하며 wildcard나 추가 필드는 허용되지 않습니다. 가재가 돌려준 rule ID와 revision으로 이후 사용을 취소합니다.
+
+```text
+/revoke-send RULE_ID REVISION
+```
+
+이 규칙은 다른 수신자, 주제, 액션, 계정이나 메시지가 아닌 변경을 승인하지 않습니다.
+
+이미 기록되고 확인된 액션에 제한된 후속 정책을 붙일 수도 있습니다.
+
+```text
+/followup {"workId":"…","actionId":"…","enabled":true,"intervalMs":60000,"maxAttempts":1}
+```
+`/followup` JSON도 첨부 없이 한 줄의 독립된 텍스트로 보냅니다.
+
+다섯 필드는 모두 필요합니다. 이 명령은 정책만 저장하고 즉시 실행하지 않으며 원본 액션이 `confirmed`가 된 뒤에만 예약된 실행이 진행됩니다. 반복마다 새 액션 식별자를 만들고 원본 리비전, 현재 권한, 기한, 횟수 상한을 다시 확인한 뒤 실제 관리형 executor를 사용합니다. 현재 권한이 없는 민감한 파생 액션은 자신의 식별자에 대한 새 `/approve`를 기다리며 원본 승인을 재사용하지 않습니다. 정책이나 액션이 바뀌거나 결과가 거절 또는 `ambiguous`면 이후 반복을 멈춥니다. 끄려면 같은 형식에서 `enabled`를 `false`로 설정합니다. 재시작 때 local-file/install/HTTP의 실행 전 단계는 실제 executor로 재개할 수 있지만 이미 실행이 시작된 중단 작업은 `ambiguous`로 조정하고 처음부터 다시 실행하지 않습니다. 명령이나 큐 등록 자체가 아니라 검증된 executor 결과를 완료 신호로 보세요.
+
+### 관리형 HTTP 호스트 설정
+
+관리형 HTTP의 endpoint와 자격 증명 권한은 프롬프트나 웹페이지가 아니라 데몬 호스트 설정에서 옵니다. `OI_HTTP_LOCAL_ORIGINS`는 private/local 주소를 허용할 정확한 `scheme://host[:port]` origin의 JSON 배열입니다. `OI_HTTP_SECRET_BINDINGS`는 툴에 보이는 reference를 정확한 `origin`, `header`, 환경 변수 이름에 연결합니다(예: `{"mailApi":{"origin":"https://api.example","header":"Authorization","environment":"MAIL_API_TOKEN"}}`). 모델은 평문 토큰 대신 `mailApi` 같은 `secretRef`만 전달하며, binding은 origin과 header가 모두 일치할 때만 사용됩니다. 민감한 header, URL query, body에 평문 자격 증명을 넣을 수 없고 공용 평문 HTTP로 secret reference를 보낼 수도 없습니다. redirect는 따라가지 않으며 별도 GET이 기대 상태를 입증해야 변경을 성공으로 기록합니다.
+이 호스트 변수는 `~/.openinstinct/env`에 `KEY=value` 줄로 넣고 파일 mode를 0600으로 유지합니다. 대화 중 가재가 새로 만들 수 있는 권한이 아니라 운영자 설정입니다.
+
+### 나를 따라오는 알림
+
+일부 사전 결과는 Chat 트랜스크립트 위 **알림** 영역에 나타납니다. OpenInstinct는 알림을 내구성 있게 보관하고 최근 활동을 기준으로 활성 Chat을 먼저, 아니면 연결된 iMessage를 선택합니다. 둘 다 없으면 전달됐다고 꾸미지 않고 기다립니다.
+
+알림을 보는 것과 확인하는 것은 다릅니다. Chat 경로 알림이 보이면 패널이 렌더링을 기록합니다. iMessage로 먼저 간 알림도 Chat dispatch 행 없이 공유 Chat 히스토리에 표시하고 렌더링할 수 있습니다. 처리한 뒤 **확인**을 누르면 acknowledgement가 기록되어 추가 라우팅을 멈춥니다. Chat에 렌더링됐지만 확인하지 않은 채 Chat이 비활성화되면 iMessage로 fallback할 수 있습니다. iMessage 큐에 넣은 것만으로 전달 완료가 아니며 Messages 원장이 확인해야 합니다. 불확실한 결과는 맹목적으로 다시 보내지 않고 reconcile합니다.
+
 ### 입력 중 표시와 읽음 표시 (선택)
 
 입력 중 표시와 읽음 표시는 선택 기능입니다. 사용하려면 시스템 설정 → 개인정보

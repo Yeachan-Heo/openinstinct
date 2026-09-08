@@ -18,6 +18,10 @@ export const CONTROL_CAPABILITIES = [
   "chat.send",
   "chat.history",
   "chat.subscribe",
+  "chat.activity",
+  "assistant.notifications.list",
+  "assistant.notifications.ack",
+  "assistant.notifications.rendered",
   "settings.get",
   "settings.set",
   "models.list",
@@ -48,6 +52,23 @@ export interface ChatHistoryPayload {
 
 export interface ChatSubscribePayload {
   readonly [key: string]: never;
+}
+
+export interface ChatActivityPayload {
+  readonly frontmost: boolean;
+  readonly lastInputAgeSeconds: number | null;
+}
+
+export interface AssistantNotificationsListPayload {
+  readonly [key: string]: never;
+}
+
+export interface AssistantNotificationAckPayload {
+  readonly notificationId: string;
+}
+
+export interface AssistantNotificationRenderedPayload {
+  readonly notificationId: string;
 }
 
 export interface ChatEventPayload extends JsonObject {
@@ -141,6 +162,10 @@ export type RequestPayload =
   | ChatSendPayload
   | ChatHistoryPayload
   | ChatSubscribePayload
+  | ChatActivityPayload
+  | AssistantNotificationsListPayload
+  | AssistantNotificationAckPayload
+  | AssistantNotificationRenderedPayload
   | JsonObject;
 
 
@@ -189,6 +214,9 @@ export const FRAME_SCHEMA = {
   event: ["type", "topic", "payload"],
   optional: {
     error: ["id"],
+    payload: {
+      "models.list": ["refresh"],
+    },
   },
   payload: {
     "status.get": [],
@@ -208,6 +236,10 @@ export const FRAME_SCHEMA = {
     "chat.send": ["text"],
     "chat.history": ["limit"],
     "chat.subscribe": [],
+    "chat.activity": ["frontmost", "lastInputAgeSeconds"],
+    "assistant.notifications.list": [],
+    "assistant.notifications.ack": ["notificationId"],
+    "assistant.notifications.rendered": ["notificationId"],
     "settings.get": [],
     "settings.set": ["patch"],
     "models.list": [],
@@ -323,7 +355,7 @@ function decodeRequest(frame: Record<string, unknown>): RequestFrame {
   const payload = expectObject(frame.payload, "request.payload");
 
   if (isKnownVerb(verb)) {
-    expectFields(payload, FRAME_SCHEMA.payload[verb], `request payload for ${verb}`);
+    expectFields(payload, FRAME_SCHEMA.payload[verb], `request payload for ${verb}`, optionalPayloadFields(verb));
     validateKnownPayload(verb, payload);
   }
 
@@ -385,6 +417,11 @@ function decodeEvent(frame: Record<string, unknown>): EventFrame {
   };
 }
 
+function optionalPayloadFields(verb: KnownVerb): readonly string[] {
+  const optional: Partial<Record<KnownVerb, readonly string[]>> = FRAME_SCHEMA.optional.payload;
+  return optional[verb] ?? [];
+}
+
 function validateKnownPayload(verb: KnownVerb, payload: Record<string, unknown>): void {
   switch (verb) {
     case "status.get":
@@ -395,7 +432,12 @@ function validateKnownPayload(verb: KnownVerb, payload: Record<string, unknown>)
     case "session.reload":
     case "session.reset":
     case "settings.get":
+      return;
     case "models.list":
+      if (payload.refresh !== undefined && typeof payload.refresh !== "boolean") {
+        throw new FrameValidationError("models.list.refresh must be boolean");
+      }
+      return;
     case "accounts.list":
     case "daemon.restart":
     case "browser.open":
@@ -407,6 +449,35 @@ function validateKnownPayload(verb: KnownVerb, payload: Record<string, unknown>)
       return;
     case "chat.subscribe":
       return;
+    case "chat.activity":
+      if (typeof payload.frontmost !== "boolean") {
+        throw new FrameValidationError("chat.activity.frontmost must be boolean");
+      }
+      if (
+        payload.lastInputAgeSeconds !== null
+        && (typeof payload.lastInputAgeSeconds !== "number"
+          || !Number.isFinite(payload.lastInputAgeSeconds)
+          || payload.lastInputAgeSeconds < 0)
+      ) {
+        throw new FrameValidationError("chat.activity.lastInputAgeSeconds must be a nonnegative finite number or null");
+      }
+      return;
+    case "assistant.notifications.list":
+      return;
+    case "assistant.notifications.ack": {
+      const notificationId = expectNonEmptyString(payload.notificationId, "assistant.notifications.ack.notificationId");
+      if (notificationId.trim().length === 0) {
+        throw new FrameValidationError("assistant.notifications.ack.notificationId must not be blank");
+      }
+      return;
+    }
+    case "assistant.notifications.rendered": {
+      const notificationId = expectNonEmptyString(payload.notificationId, "assistant.notifications.rendered.notificationId");
+      if (notificationId.trim().length === 0) {
+        throw new FrameValidationError("assistant.notifications.rendered.notificationId must not be blank");
+      }
+      return;
+    }
     case "chat.send": {
       const text = expectNonEmptyString(payload.text, "chat.send.text");
       if (text.length > 4_000) {

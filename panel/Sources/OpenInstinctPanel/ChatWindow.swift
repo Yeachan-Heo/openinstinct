@@ -9,6 +9,7 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
     static let shared = ChatWindowController()
     private var window: NSWindow?
     private var chat: ChatViewModel?
+    private var activityReporter: ChatActivityReporter?
 
     func show(model: PanelViewModel) {
         if window == nil {
@@ -23,14 +24,20 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
             w.delegate = self
             w.center()
             window = w
+            activityReporter = ChatActivityReporter(window: w) { [weak chat] sample in
+                chat?.reportActivity(sample)
+            }
         }
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        activityReporter?.start()
     }
 
     /// Closing the window ends the subscription; reopening starts a fresh one
     /// so the open protocol re-runs and history is reloaded.
     func windowWillClose(_ notification: Notification) {
+        activityReporter?.stop()
+        activityReporter = nil
         chat?.close()
         chat = nil
         window = nil
@@ -51,6 +58,10 @@ struct ChatView: View {
                     .padding(.horizontal, 12)
                     .padding(.vertical, 6)
                     .background(.quaternary)
+            }
+            if !chat.pendingNotifications.isEmpty || chat.notificationError != nil {
+                notificationSection
+                Divider()
             }
             ScrollViewReader { proxy in
                 ScrollView {
@@ -83,6 +94,51 @@ struct ChatView: View {
     }
 
     private static let typingAnchor = "typing-indicator"
+
+    private var notificationSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("알림")
+                    .font(.headline)
+                Spacer()
+                if chat.notificationsLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+            ForEach(chat.pendingNotifications) { notification in
+                HStack(alignment: .top, spacing: 8) {
+                    Text(notification.text)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                    Button("확인") {
+                        Task { await chat.acknowledgeNotification(notification.id) }
+                    }
+                    .disabled(chat.acknowledgingNotificationIDs.contains(notification.id))
+                }
+                .padding(8)
+                .background(Color(nsColor: .windowBackgroundColor))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .onAppear {
+                    chat.reportNotificationRendered(notification.id)
+                }
+            }
+            if let error = chat.notificationError {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Button("다시 시도") {
+                        Task { await chat.refreshNotifications() }
+                    }
+                    .disabled(chat.notificationsLoading)
+                }
+            }
+        }
+        .padding(12)
+        .background(Color(nsColor: .controlBackgroundColor))
+    }
 
     private var composer: some View {
         VStack(alignment: .leading, spacing: 4) {

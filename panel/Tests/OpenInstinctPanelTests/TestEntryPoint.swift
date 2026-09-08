@@ -16,12 +16,13 @@ public func runOpenInstinctPanelTests() -> Int32 {
         results.append(await HealthMappingChecks.run())
         results.append(await ChatViewModelChecks.run())
         results.append(await UpdateCheckerChecks.run())
+        results.append(await ChatActivityReporterChecks.run())
         completion.signal()
     }
     completion.wait()
 
     let failures = results.values
-    let totalChecks = 9
+    let totalChecks = 10
     if failures.isEmpty {
         print("OpenInstinctPanelTests: \(totalChecks) checks passed")
         return 0

@@ -34,8 +34,10 @@ mv -f "$target.new" "$target"
 
 # First install: carry over the host's OAuth credentials so the owner does not
 # sign in twice. Later drift stays isolated because the copy is one-time.
+# models.yml is deliberately not copied: the daemon symlinks it to the host's
+# so provider edits in ~/.gjc/agent/models.yml show up without a re-import.
 if [ ! -f "$state_home/gjc/.imported" ] && [ -d "$HOME/.gjc/agent" ] && ! pgrep -qf "openinstinctd .*main.ts"; then
-  for f in auth.db agent.db models.yml; do
+  for f in auth.db agent.db; do
     if [ -f "$HOME/.gjc/agent/$f" ]; then
       # sqlite3 backup copies a consistent snapshot including WAL contents.
       case "$f" in

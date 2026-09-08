@@ -277,8 +277,12 @@ async function scenarioConversationalChild(): Promise<ScenarioResult> {
 
   const minimumRowid = readConversationChild(childId)?.cursor ?? 0;
   const config = await readRuntimeConfig(paths.config);
+  const ownerHandle = config.allowlistHandle;
+  if (!ownerHandle) {
+    return fail("post-restart owner-message verification requires an attached iMessage owner handle");
+  }
   const inbound = await waitFor(
-    () => findInboundMessage(token, config.allowlistHandle, minimumRowid),
+    () => findInboundMessage(token, ownerHandle, minimumRowid),
     options.waitSeconds * 1_000,
     1_000,
   );

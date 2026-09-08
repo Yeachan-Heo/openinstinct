@@ -1,4 +1,6 @@
 import { join } from "node:path";
+import type { CustomTool } from "@gajae-code/coding-agent";
+import type { AssistantWorkRepository } from "../../store/assistant-work.ts";
 
 import type { ChildConversation, ChildTurnResult, ConversationalChildRunner } from "../conversation.ts";
 import { SdkChildSessionFactory, type ChildAgentSession, type ChildSessionFactory } from "./sdk-inprocess.ts";
@@ -12,6 +14,10 @@ export interface SdkConversationRunnerOptions {
   readonly onEvent?: (event: string, fields: Record<string, unknown>) => void;
   readonly interimMaxBytes?: number;
   readonly interimRatePerMinute?: number;
+  /** Managed tools available to ordinary conversational children. */
+  readonly customTools?: readonly CustomTool[];
+  /** Production-only durable authority/effect ledger for the raw tool gate. */
+  readonly assistantWorkRepository?: AssistantWorkRepository;
 }
 
 /** Long-lived SDK adapter used only by delegate_background children. */
@@ -23,7 +29,7 @@ export class SdkConversationRunner implements ConversationalChildRunner {
     if (!options.factory && !options.modelPattern) {
       throw new Error("SdkConversationRunner needs modelPattern when using the production SDK factory");
     }
-    this.factory = options.factory ?? new SdkChildSessionFactory(options.modelPattern!);
+    this.factory = options.factory ?? new SdkChildSessionFactory(options.modelPattern!, options.assistantWorkRepository);
   }
 
   public async open(
@@ -45,6 +51,18 @@ export class SdkConversationRunner implements ConversationalChildRunner {
     },
     signal: AbortSignal,
   ): Promise<ChildConversation> {
+    const customTools = [
+      ...(this.options.customTools ?? []),
+      ...(input.onReport === undefined
+        ? []
+        : [createReportProgressTool({
+          childId: input.childId,
+          title: input.title,
+          admit: input.onReport,
+          ...(this.options.interimMaxBytes === undefined ? {} : { maxBytes: this.options.interimMaxBytes }),
+          ...(this.options.interimRatePerMinute === undefined ? {} : { ratePerMinute: this.options.interimRatePerMinute }),
+        })]),
+    ];
     const session = await this.factory.create({
       childId: input.childId,
       title: input.title,
@@ -52,17 +70,7 @@ export class SdkConversationRunner implements ConversationalChildRunner {
       sessionDirectory: join(this.options.root, "sessions", input.childId),
       ...(input.sessionFile === undefined ? {} : { sessionFile: input.sessionFile }),
       conversational: true,
-      ...(input.onReport === undefined
-        ? {}
-        : {
-          customTools: [createReportProgressTool({
-            childId: input.childId,
-            title: input.title,
-            admit: input.onReport,
-            ...(this.options.interimMaxBytes === undefined ? {} : { maxBytes: this.options.interimMaxBytes }),
-            ...(this.options.interimRatePerMinute === undefined ? {} : { ratePerMinute: this.options.interimRatePerMinute }),
-          })],
-        }),
+      ...(customTools.length === 0 ? {} : { customTools }),
     });
     if (signal.aborted) {
       await Promise.race([
