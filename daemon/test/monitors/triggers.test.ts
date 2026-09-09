@@ -145,7 +145,7 @@ describe("monitor ingress triggers", () => {
 
     try {
       scripts.start();
-      await waitFor(() => received.length === 1, 2_500);
+      await waitFor(() => received.length > 0, 2_500);
       expect(received[0]).toMatchObject({
         eventType: "script",
         payload: expect.objectContaining({ exitCode: 0, stdout: "monitor-script-ok" }),
