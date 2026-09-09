@@ -96,10 +96,27 @@ describe("monitor ingress triggers", () => {
 
     try {
       watcher.start();
+      // Native subscription startup is asynchronous on macOS. Observe a separate
+      // path before measuring the note.txt burst rather than losing that burst.
+      let nextProbeAt = 0;
+      await waitFor(() => {
+        if (received.some((event) => event.occurrenceKey?.startsWith(`watcher:${watched}:ready.txt:`))) return true;
+        if (Date.now() >= nextProbeAt) {
+          writeFileSync(join(watched, "ready.txt"), String(Date.now()));
+          nextProbeAt = Date.now() + 100;
+        }
+        return false;
+      });
+      const noteEvents = () => received.filter((event) => event.occurrenceKey?.startsWith(`watcher:${watched}:note.txt:`));
       writeFileSync(join(watched, "note.txt"), "one");
       writeFileSync(join(watched, "note.txt"), "two");
-      await waitFor(() => received.length === 1);
-      expect(received[0]).toMatchObject({ eventType: expect.stringMatching(/^watcher\./) });
+      await waitFor(() => noteEvents().length > 0);
+      await Bun.sleep(100);
+      expect(noteEvents()).toHaveLength(1);
+      expect(noteEvents()[0]).toMatchObject({
+        eventType: expect.stringMatching(/^watcher\./),
+        payload: { root: watched, path: "note.txt" },
+      });
     } finally {
       watcher.stop();
       store.close();
