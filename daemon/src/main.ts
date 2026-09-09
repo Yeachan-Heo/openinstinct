@@ -252,7 +252,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonRu
   const assistantWorkRuntime = new AssistantWorkRuntime({
     store,
     isPaused: () => paused() || closing || core === undefined,
-    onError: (error) => logger.write("error", "assistant_work", "runtime_failed", { message: messageOf(error) }),
+    onError: (error) => logger.write("error", "assistant_work", "runtime_failed", { message: assistantWorkErrorMessage(error) }),
     report: async (report, key) => {
       const session = core?.session;
       if (!session || session.busy) return false;
@@ -1522,6 +1522,34 @@ function ensureMessagesRunning(logger: NdjsonLogger): void {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** Keep recovery context and root evidence without serializing arbitrary error payloads. */
+function assistantWorkErrorMessage(error: unknown): string {
+  const messages: string[] = [];
+  const seen = new Set<Error>();
+  let current = error;
+  for (let depth = 0; depth < 8; depth += 1) {
+    if (current instanceof Error) {
+      if (seen.has(current)) {
+        messages.push("[cyclic cause]");
+        return messages.join("; caused by: ");
+      }
+      seen.add(current);
+      const message = current.message;
+      messages.push(message.length > 512 ? `${message.slice(0, 512)}…` : message);
+      if (current.cause === undefined) return messages.join("; caused by: ");
+      current = current.cause;
+    } else {
+      const message = current === null || ["string", "number", "boolean", "undefined", "bigint"].includes(typeof current)
+        ? String(current)
+        : "[non-Error cause]";
+      messages.push(message.length > 512 ? `${message.slice(0, 512)}…` : message);
+      return messages.join("; caused by: ");
+    }
+  }
+  messages.push("[cause depth limit]");
+  return messages.join("; caused by: ");
 }
 
 function hasCredentialEnvPatch(patch: JsonObject): boolean {

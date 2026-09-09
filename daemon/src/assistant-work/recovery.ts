@@ -29,6 +29,15 @@ export type FollowupTickResult =
   | { readonly kind: "not_dispatched"; readonly reason: FollowupSkip["reason"] }
   | { readonly kind: "recovered_attempt"; readonly recovery: AttemptRecoveryResult };
 
+export type FollowupRecoveryResult = FollowupTickResult | {
+  readonly kind: "recovery_failed";
+  readonly actionId: string;
+  readonly error: Error;
+} & (
+  | { readonly dispatchId: string; readonly attemptId?: never }
+  | { readonly attemptId: string; readonly dispatchId?: never }
+);
+
 export function stableRecoveryReport(report: AuthoredRecoveryReport): FollowupReportInput {
   const id = createHash("sha256").update(canonicalJson({
     code: report.code,
@@ -89,29 +98,44 @@ export class FollowupRecoveryService {
     return { kind: "recovered_attempt", recovery };
   }
 
-  public async recover(): Promise<readonly FollowupTickResult[]> {
-    const results: FollowupTickResult[] = [];
+  /** Each failed record is returned explicitly; unrelated records still recover. */
+  public async recover(): Promise<readonly FollowupRecoveryResult[]> {
+    const results: FollowupRecoveryResult[] = [];
     const associated = new Set<string>();
+    const failedFollowupActions = new Set<string>();
     for (const dispatch of this.options.repository.listFollowupDispatches().filter((row) => row.state === "claimed")) {
-      const action = this.options.repository.getAction(dispatch.actionId);
-      const attemptId = action?.activeAttemptId;
-      const claim = this.options.repository.recoverClaimedFollowup(dispatch.id, this.options.workerId, this.now());
-      if (attemptId) {
-        const recoveredAttempt = this.options.repository.getAttempt(attemptId);
-        if (recoveredAttempt?.state !== "effect_started" && recoveredAttempt?.state !== "claimed_pre_effect") {
-          associated.add(attemptId);
+      try {
+        const action = this.options.repository.getAction(dispatch.actionId);
+        const attemptId = action?.activeAttemptId;
+        const claim = this.options.repository.recoverClaimedFollowup(dispatch.id, this.options.workerId, this.now());
+        if (attemptId) {
+          const recoveredAttempt = this.options.repository.getAttempt(attemptId);
+          if (recoveredAttempt?.state !== "effect_started" && recoveredAttempt?.state !== "claimed_pre_effect") {
+            associated.add(attemptId);
+          }
         }
-      }
-      if (claim.kind === "none") {
-        await this.reportSkip(dispatch.workId, claim);
-        results.push({ kind: "not_dispatched", reason: claim.reason });
-      } else {
-        if (attemptId) associated.add(attemptId);
-        results.push(await this.executeClaim(claim));
+        if (claim.kind === "none") {
+          await this.reportSkip(dispatch.workId, claim);
+          results.push({ kind: "not_dispatched", reason: claim.reason });
+        } else {
+          if (attemptId) associated.add(attemptId);
+          results.push(await this.executeClaim(claim));
+        }
+      } catch (cause) {
+        // Dispatch identity is available even when strict action decoding fails.
+        failedFollowupActions.add(dispatch.actionId);
+        results.push({ kind: "recovery_failed", actionId: dispatch.actionId, dispatchId: dispatch.id,
+          error: new Error(`Assistant work recovery failed for dispatch ${dispatch.id} work ${dispatch.workId} action ${dispatch.actionId}`, { cause }) });
       }
     }
     for (const attempt of this.options.repository.listRecoveryCandidates()) {
-      if (!associated.has(attempt.id)) results.push(await this.recoverAttempt(attempt.id));
+      if (associated.has(attempt.id) || failedFollowupActions.has(attempt.actionId)) continue;
+      try {
+        results.push(await this.recoverAttempt(attempt.id));
+      } catch (cause) {
+        results.push({ kind: "recovery_failed", actionId: attempt.actionId, attemptId: attempt.id,
+          error: new Error(`Assistant work recovery failed for attempt ${attempt.id} action ${attempt.actionId}`, { cause }) });
+      }
     }
     return results;
   }

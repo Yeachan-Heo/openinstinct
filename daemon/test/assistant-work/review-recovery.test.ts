@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -219,6 +220,65 @@ function prepareStartedFollowup(
 }
 
 describe("review recovery boundary regressions", () => {
+  test("reopened obsolete claimed dispatches cannot starve standalone recovery or bypass association", async () => {
+    const path = stateDbPath();
+    const initial = openStateStore(path);
+    const obsolete = ["authorized", "approval_pending"].map((state) => {
+      const fixture = setupMessage(initial, state);
+      setPolicy(initial, fixture.work.id, fixture.action.id);
+      const claim = initial.assistantWork.claimDueFollowup(fixture.work.id, FOLLOWUP_WORKER, T1);
+      if (claim.kind !== "claimed") throw new Error("expected claimed fixture");
+      return { state, claim };
+    });
+    const associated = prepareClaimedFollowup(initial, "failed-associated");
+    const broken = setupMessage(initial, "broken-standalone", { confirmed: false }).action;
+    claimAction(initial.assistantWork, broken, "broken-standalone-attempt", "old-worker", T1);
+    const pre = setupMessage(initial, "standalone-pre", { confirmed: false }).action;
+    const started = setupMessage(initial, "standalone-started", { confirmed: false }).action;
+    claimAction(initial.assistantWork, pre, "healthy-pre", "old-worker", T1);
+    claimAction(initial.assistantWork, started, "healthy-started", "old-worker", T1);
+    initial.assistantWork.markEffectStarted({ attemptId: "healthy-started", workerId: "old-worker" }, T1);
+    initial.close();
+    const db = new Database(path);
+    try {
+      for (const entry of obsolete) db.query("UPDATE assistant_work_actions SET state = ? WHERE id = ?").run(entry.state, entry.claim.action.id);
+      // The associated action remains valid: its source decoding fails before policy recovery.
+      db.query("UPDATE assistant_work_actions SET state = 'authorized' WHERE id = ?").run(associated.action.id);
+      db.query("UPDATE assistant_work_actions SET state = 'authorized' WHERE id = ?").run(broken.id);
+    } finally { db.close(); }
+    const store = openStateStore(path);
+    try {
+      const executor = managedConfirmedExecutor(store.assistantWork, () => T2);
+      const service = new FollowupRecoveryService({ repository: store.assistantWork, workerId: FOLLOWUP_WORKER, now: () => T2, dispatch: executor.dispatch });
+      const results = await service.recover();
+      const failures = results.filter((result) => result.kind === "recovery_failed");
+      expect(failures).toHaveLength(4);
+      expect(failures).toContainEqual(expect.objectContaining({ kind: "recovery_failed", actionId: broken.id, attemptId: "broken-standalone-attempt" }));
+      for (const failure of failures) {
+        expect(failure.error).toBeInstanceOf(Error);
+        expect(failure.error.cause).toBeInstanceOf(Error);
+        expect(String(failure.error.cause)).toContain("unsupported assistant action state");
+      }
+      expect(executor.calls.map((call) => call.attemptId)).toEqual(["healthy-pre"]);
+      expect(store.assistantWork.getAttempt("healthy-pre")?.state).toBe("confirmed");
+      expect(store.assistantWork.getAttempt("healthy-started")?.state).toBe("ambiguous");
+      expect(store.assistantWork.getAttempt(associated.attemptId)).toMatchObject({ state: "claimed_pre_effect", workerId: FOLLOWUP_WORKER, recoveryCount: 0 });
+      expect(store.assistantWork.listPendingFollowupReports()).toContainEqual(expect.objectContaining({ attemptId: "healthy-started", code: "attempt_reconcile_only" }));
+      await service.recover();
+      expect(executor.calls).toHaveLength(1);
+      expect(store.assistantWork.listAttempts(pre.id)).toHaveLength(1);
+      expect(store.assistantWork.listAttempts(started.id)).toHaveLength(1);
+      for (const entry of obsolete) {
+        expect(store.assistantWork.getFollowupDispatch(entry.claim.dispatch.id)).toEqual(entry.claim.dispatch);
+        expect(store.assistantWork.listAttempts(entry.claim.action.id)).toHaveLength(0);
+      }
+      const preserved = new Database(path, { readonly: true });
+      try {
+        for (const entry of obsolete) expect(preserved.query("SELECT state, current_digest FROM assistant_work_actions WHERE id = ?").get(entry.claim.action.id))
+          .toEqual({ state: entry.state, current_digest: entry.claim.action.digest });
+      } finally { preserved.close(); }
+    } finally { store.close(); }
+  });
   test("verified follow-up resolution creates one report and replay preserves schedule", () => {
     const store = openStateStore(stateDbPath());
     try {

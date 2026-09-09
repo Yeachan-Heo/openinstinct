@@ -110,11 +110,25 @@ test("reopened runtime isolates obsolete due policies and report failures while 
   }
   const obsolete = await seed("obsolete", at);
   const healthy = await seed("healthy", later);
+  const obsoleteDispatch = initial.assistantWork.claimDueFollowup(obsolete.work.id, "old-runtime", later);
+  if (obsoleteDispatch.kind !== "claimed") throw new Error("expected claimed obsolete fixture");
+  const standalone = [];
+  for (const state of ["claimed_pre_effect", "effect_started"] as const) {
+    const path = join(root, `${state}.txt`);
+    writeFileSync(path, "before");
+    const work = initial.assistantWork.admitObservation({ source: "fixture", occurrenceKey: state, workKey: state,
+      workTitle: state, observedAt: at, evidence: {}, provenance: { principal: "system", channel: "fixture", subject: state, evidenceId: state } }, at).work;
+    const preflight = await preflightLocalFileAction({ workId: work.id, semanticKey: state, operations: [{ operation: "write_file", path, content: "after" }] });
+    const action = initial.assistantWork.proposeAction(preflight.proposal, at);
+    initial.assistantWork.claimForDispatch({ actionId: action.id, revision: action.revision, digest: action.digest, attemptId: state, workerId: "old-runtime" }, at);
+    if (state === "effect_started") initial.assistantWork.markEffectStarted({ attemptId: state, workerId: "old-runtime" }, at);
+    standalone.push({ state, path, action });
+  }
   initial.assistantWork.admitFollowupReport({ id: "bad-report", code: "fixture_bad", detail: {} }, at);
   initial.assistantWork.admitFollowupReport({ id: "healthy-report", code: "fixture_healthy", detail: {} }, later);
   initial.close();
   const db = new Database(dbPath);
-  try { db.query("UPDATE assistant_work_actions SET state = 'approval_pending' WHERE id = ?").run(obsolete.action.id); }
+  try { db.query("UPDATE assistant_work_actions SET state = 'approval_pending' WHERE id = ?").run(obsoleteDispatch.action.id); }
   finally { db.close(); }
   const store = StateStore.open(dbPath);
   const errors: unknown[] = [];
@@ -135,8 +149,30 @@ test("reopened runtime isolates obsolete due policies and report failures while 
     await runtime.drain();
     expect(readFileSync(obsolete.path, "utf8")).toBe("before");
     expect(readFileSync(healthy.path, "utf8")).toBe("after");
-    expect(store.assistantWork.listFollowupDispatches(obsolete.work.id)).toHaveLength(0);
+    expect(store.assistantWork.getFollowupDispatch(obsoleteDispatch.dispatch.id)).toEqual(obsoleteDispatch.dispatch);
+    expect(store.assistantWork.listAttempts(obsoleteDispatch.action.id)).toHaveLength(0);
+    for (const entry of standalone) {
+      expect(readFileSync(entry.path, "utf8")).toBe(entry.state === "claimed_pre_effect" ? "after" : "before");
+      expect(store.assistantWork.getAttempt(entry.state)?.state).toBe(entry.state === "claimed_pre_effect" ? "confirmed" : "ambiguous");
+      expect(store.assistantWork.listAttempts(entry.action.id)).toHaveLength(1);
+    }
     expect(store.assistantWork.listAttempts(obsolete.action.id)).toHaveLength(1);
+    const recoveryError = errors.find((error) => error instanceof Error && error.message.includes(`dispatch ${obsoleteDispatch.dispatch.id}`));
+    expect(recoveryError).toBeInstanceOf(Error);
+    expect(String((recoveryError as Error).cause)).toContain("unsupported assistant action state");
+    expect(delivered.some((id) => store.assistantWork.getFollowupReport(id)?.code === "attempt_reconcile_only")).toBe(true);
+    const deliveredBefore = [...delivered];
+    await runtime.drain();
+    expect(delivered).toEqual(deliveredBefore);
+    for (const entry of standalone) {
+      expect(store.assistantWork.listAttempts(entry.action.id)).toHaveLength(1);
+      expect(readFileSync(entry.path, "utf8")).toBe(entry.state === "claimed_pre_effect" ? "after" : "before");
+    }
+    const preserved = new Database(dbPath, { readonly: true });
+    try {
+      expect(preserved.query("SELECT state, current_digest FROM assistant_work_actions WHERE id = ?").get(obsoleteDispatch.action.id))
+        .toEqual({ state: "approval_pending", current_digest: obsoleteDispatch.action.digest });
+    } finally { preserved.close(); }
     const dispatches = store.assistantWork.listFollowupDispatches(healthy.work.id);
     expect(dispatches).toMatchObject([{ state: "completed", outcome: { kind: "confirmed" } }]);
     expect(store.assistantWork.listAttempts(dispatches[0]!.actionId)).toMatchObject([{ state: "confirmed" }]);

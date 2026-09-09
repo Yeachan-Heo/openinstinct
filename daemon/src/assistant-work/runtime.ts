@@ -55,8 +55,11 @@ export class AssistantWorkRuntime {
     if (this.stopped || this.options.isPaused()) return;
     if (!this.recovered) {
       try {
-        await this.recovery.recover();
-        this.recovered = true;
+        const results = await this.recovery.recover();
+        this.recovered = !results.some((result) => result.kind === "recovery_failed");
+        for (const result of results) {
+          if (result.kind === "recovery_failed") this.options.onError(result.error);
+        }
       } catch (error) {
         this.options.onError(new Error("Assistant work startup recovery failed", { cause: error }));
       }

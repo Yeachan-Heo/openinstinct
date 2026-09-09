@@ -341,6 +341,33 @@ describe("durable follow-up policy", () => {
 });
 
 describe("follow-up dispatch races and recovery", () => {
+  test("recovery returns the original executor failure and continues later claimed dispatches", async () => {
+    const store = openStateStore(stateDbPath());
+    try {
+      const first = setupConfirmedMessage(store, "executor-fails");
+      const second = setupConfirmedMessage(store, "executor-healthy");
+      setPolicy(store, first.work.id, first.action.id, 1);
+      setPolicy(store, second.work.id, second.action.id, 1);
+      const failed = store.assistantWork.claimDueFollowup(first.work.id, "worker", T1);
+      const healthy = store.assistantWork.claimDueFollowup(second.work.id, "worker", T1);
+      if (failed.kind !== "claimed" || healthy.kind !== "claimed") throw new Error("expected claimed fixtures");
+      const cause = new Error("executor unavailable before effect");
+      const executor = confirmedExecutor(store.assistantWork);
+      const service = new FollowupRecoveryService({ repository: store.assistantWork, workerId: "worker", now: () => T1,
+        dispatch: async (action, attemptId, workerId) => {
+          if (action.id === failed.action.id) throw cause;
+          return executor.dispatch(action, attemptId, workerId);
+        } });
+      const results = await service.recover();
+      const failure = results.find((result) => result.kind === "recovery_failed");
+      expect(failure).toMatchObject({ kind: "recovery_failed", actionId: failed.action.id, dispatchId: failed.dispatch.id });
+      if (failure?.kind !== "recovery_failed") throw new Error("expected explicit failure");
+      expect(failure.error.cause).toBe(cause);
+      expect(executor.calls.map((call) => call.actionId)).toEqual([healthy.action.id]);
+      expect(store.assistantWork.getFollowupDispatch(healthy.dispatch.id)?.state).toBe("completed");
+      expect(store.assistantWork.listAttempts(failed.action.id)).toHaveLength(0);
+    } finally { store.close(); }
+  });
   test("concurrent ticks invoke one real executor and persist one ordinal settlement", async () => {
     const path = stateDbPath();
     const firstStore = openStateStore(path);
