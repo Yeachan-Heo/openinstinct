@@ -1,11 +1,12 @@
 import type { StateStore } from "../store/db.ts";
-import { FollowupRecoveryService, type AuthoredRecoveryReport } from "./recovery.ts";
+import { FollowupRecoveryService, type AuthoredRecoveryReport, type FollowupRecoveryScope } from "./recovery.ts";
 import { dispatchManagedAction } from "./dispatch.ts";
 import { configuredHttpAccess } from "./http-policy.ts";
 import { reconcileManagedAttempt } from "./reconcile.ts";
 
 export class AssistantWorkRuntime {
   private readonly recovery: FollowupRecoveryService;
+  private readonly startupScope: FollowupRecoveryScope;
   private timer: ReturnType<typeof setInterval> | undefined;
   private running: Promise<void> | undefined;
   private recovered = false;
@@ -27,6 +28,8 @@ export class AssistantWorkRuntime {
       }),
       authoredReport: async () => undefined,
     });
+    // Capture before delayed/paused startup can admit live work owned by other workers.
+    this.startupScope = this.recovery.captureRecoveryScope();
   }
 
   public start(): void {
@@ -55,7 +58,7 @@ export class AssistantWorkRuntime {
     if (this.stopped || this.options.isPaused()) return;
     if (!this.recovered) {
       try {
-        const results = await this.recovery.recover();
+        const results = await this.recovery.recover(this.startupScope);
         this.recovered = !results.some((result) => result.kind === "recovery_failed");
         for (const result of results) {
           if (result.kind === "recovery_failed") this.options.onError(result.error);

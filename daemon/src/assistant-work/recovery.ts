@@ -38,6 +38,11 @@ export type FollowupRecoveryResult = FollowupTickResult | {
   | { readonly attemptId: string; readonly dispatchId?: never }
 );
 
+export interface FollowupRecoveryScope {
+  readonly dispatches: readonly Pick<FollowupDispatchRecord, "id" | "actionId" | "workId">[];
+  readonly attempts: readonly Pick<AttemptRecord, "id" | "actionId">[];
+}
+
 export function stableRecoveryReport(report: AuthoredRecoveryReport): FollowupReportInput {
   const id = createHash("sha256").update(canonicalJson({
     code: report.code,
@@ -98,13 +103,23 @@ export class FollowupRecoveryService {
     return { kind: "recovered_attempt", recovery };
   }
 
+
+  public captureRecoveryScope(): FollowupRecoveryScope {
+    return {
+      dispatches: this.options.repository.listFollowupDispatches().filter((row) => row.state === "claimed")
+        .map(({ id, actionId, workId }) => ({ id, actionId, workId })),
+      attempts: this.options.repository.listRecoveryCandidates().map(({ id, actionId }) => ({ id, actionId })),
+    };
+  }
+
   /** Each failed record is returned explicitly; unrelated records still recover. */
-  public async recover(): Promise<readonly FollowupRecoveryResult[]> {
+  public async recover(scope: FollowupRecoveryScope = this.captureRecoveryScope()): Promise<readonly FollowupRecoveryResult[]> {
     const results: FollowupRecoveryResult[] = [];
     const associated = new Set<string>();
     const failedFollowupActions = new Set<string>();
-    for (const dispatch of this.options.repository.listFollowupDispatches().filter((row) => row.state === "claimed")) {
+    for (const dispatch of scope.dispatches) {
       try {
+        if (this.options.repository.getFollowupDispatch(dispatch.id)?.state !== "claimed") continue;
         const action = this.options.repository.getAction(dispatch.actionId);
         const attemptId = action?.activeAttemptId;
         const claim = this.options.repository.recoverClaimedFollowup(dispatch.id, this.options.workerId, this.now());
@@ -128,9 +143,11 @@ export class FollowupRecoveryService {
           error: new Error(`Assistant work recovery failed for dispatch ${dispatch.id} work ${dispatch.workId} action ${dispatch.actionId}`, { cause }) });
       }
     }
-    for (const attempt of this.options.repository.listRecoveryCandidates()) {
+    for (const attempt of scope.attempts) {
       if (associated.has(attempt.id) || failedFollowupActions.has(attempt.actionId)) continue;
       try {
+        const current = this.options.repository.getAttempt(attempt.id);
+        if (!current || (current.state !== "claimed_pre_effect" && current.state !== "effect_started" && current.state !== "ambiguous")) continue;
         results.push(await this.recoverAttempt(attempt.id));
       } catch (cause) {
         results.push({ kind: "recovery_failed", actionId: attempt.actionId, attemptId: attempt.id,

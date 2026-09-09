@@ -220,6 +220,29 @@ function prepareStartedFollowup(
 }
 
 describe("review recovery boundary regressions", () => {
+  test("captured dispatch identity retains its derived attempt while excluding newly admitted standalone identities", async () => {
+    const store = openStateStore(stateDbPath());
+    try {
+      const fixture = setupMessage(store, "captured-dispatch");
+      setPolicy(store, fixture.work.id, fixture.action.id);
+      const claim = store.assistantWork.claimDueFollowup(fixture.work.id, FOLLOWUP_WORKER, T1);
+      if (claim.kind !== "claimed") throw new Error("expected claimed fixture");
+      const executor = managedConfirmedExecutor(store.assistantWork, () => T2);
+      const service = new FollowupRecoveryService({ repository: store.assistantWork, workerId: FOLLOWUP_WORKER, now: () => T2, dispatch: executor.dispatch });
+      const scope = service.captureRecoveryScope();
+      expect(scope.attempts).toHaveLength(0);
+      claimAction(store.assistantWork, claim.action, "original-dispatch-later-attempt", "old-dispatch-worker", T1);
+      const live = setupMessage(store, "new-standalone", { confirmed: false }).action;
+      claimAction(store.assistantWork, live, "new-standalone-attempt", "live-worker", T1);
+      const before = store.assistantWork.getAttempt("new-standalone-attempt");
+      await service.recover(scope);
+      expect(executor.calls.map((call) => call.attemptId)).toEqual(["original-dispatch-later-attempt"]);
+      expect(store.assistantWork.getAttempt("new-standalone-attempt")).toEqual(before);
+      await service.recover(scope);
+      expect(executor.calls).toHaveLength(1);
+      expect(store.assistantWork.getAttempt("new-standalone-attempt")).toEqual(before);
+    } finally { store.close(); }
+  });
   test("reopened obsolete claimed dispatches cannot starve standalone recovery or bypass association", async () => {
     const path = stateDbPath();
     const initial = openStateStore(path);
