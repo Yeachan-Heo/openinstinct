@@ -25,7 +25,7 @@ macOS launchd 데몬 하나(`openinstinctd`, `daemon/src/main.ts`를 도는 Bun 
 
 `env-bootstrap.ts`가 첫 import: `@gajae-code/coding-agent`가 평가되기 *전에* `~/.openinstinct/env`를 `process.env`에 넣습니다. SDK가 모듈 로드 시점에 자동 임포트한 자격 증명을 주입하는데, 소유자 파일이 이겨야 하기 때문입니다. 그 다음 `startDaemon()`:
 
-1. **부트스트랩 머신**이 `config`와 AI 자격 증명을 프로브합니다. 코어 레인을 막는 것은 자격 증명뿐입니다. `config.json`이 없거나 형식이 잘못되어도 시작을 막지 않습니다. `core-config.ts`가 범위별 제품 기본값을 적용하고 폴백을 로그로 남깁니다. 소유자 handle이 설정된 경우에만 전체 디스크 접근 권한(`chat.db`)과 자동화(Messages에 `osascript` 질의)를 추가로 프로브하며, 채팅만 쓰는 설치에서는 이 프로브를 건너뜁니다. 5초마다 재프로브하고 상태를 소켓에 공개합니다.
+1. **부트스트랩 머신**이 `config`와 AI 자격 증명을 프로브합니다. 코어 레인을 막는 것은 자격 증명뿐입니다. `config.json`이 없거나 형식이 잘못되어도 시작을 막지 않습니다. `core-config.ts`가 범위별 제품 기본값을 적용하고 폴백을 로그로 남깁니다. 전체 디스크 접근(FDA, `chat.db`)은 Chat만 써도 프로브하는 필수 기본 권한입니다. 거부·미확인·프로브 오류는 OS 기능 제한 진단으로 표시하며 코어를 중단하지 않습니다. FDA는 시스템 설정에서 소유자가 한 번 켜는 macOS TCC 스위치이지 작업별 확인이 아닙니다. 런타임이 스스로 부여할 수 없고 실제 프로브 성공만 접근 근거가 됩니다. 선택적 Messages 권한 프로브는 소유자 handle이 설정된 경우에 실행합니다. 5초마다 재프로브하고 상태를 소켓에 공개합니다.
 
 2. **스토어**가 `state.db`를 엽니다(마이그레이션은 `store/migrations.ts`).
 3. **제어 서버**는 코어가 자격 증명을 기다리는 중에도 소켓에서 즉시 리슨하므로 패널이 이유를 보여줄 수 있습니다.
@@ -74,40 +74,31 @@ iMessage 어댑터는 계속 `imessage/reader.ts`로 `chat.db`(읽기 전용, WA
 - **리로드**(`session.reload`): 같은 트랜스크립트 위에 dispose + 재생성 → 바뀐 시스템 프롬프트가 히스토리 손실 없이 적용.
 - **시스템 프롬프트** = gjc 기본값 그대로 → `persona/GAJAE_SOUL.md`(캐릭터, 버전 관리) → `persona/RUNTIME.md`(환경: iMessage, 플레인 텍스트, 위임 규칙, 모니터 규칙, Chrome 프로파일; `{{ownerHandle}}` 등은 config에서 치환).
 - **커스텀 툴**: `delegate_background`, `send_image`, `child_nudge`, `child_status`, `monitor_author`, `memory_search`, `memory_capture`, `memory_audit`, `assistant_work_observe`, `assistant_service_monitor`, `assistant_local_file`, `assistant_work_status`, `assistant_managed_install`, `assistant_managed_http`. 작업/대화형 자식에는 관리형 로컬 파일 툴을, 모니터 자식에는 관찰 및 읽기 전용 서비스 모니터 툴을 제공합니다.
-- **익스텐션**: `browser/enforce.ts`가 브라우저 프로파일을 강제하고, 관리형 raw-effect gate가 실제 메인/자식 SDK의 `tool_call`/`tool_result` 라이프사이클을 감쌉니다.
+- **익스텐션**: `browser/enforce.ts`는 계정 신원과 동시 탭 충돌 방지를 위해 전용 Chrome 프로파일과 자식 탭 라우팅을 강제합니다. 그 밖의 SDK hard-enforcer 제한은 제거되었습니다. 네이티브 권한 기본값은 allow이며 애플리케이션 경로 금지 목록, Discord API 일괄 금지, 메인 셸 timeout 제한, 고정 툴 호출 횟수, task·subagent·job 금지는 없습니다. OS·서비스 권한은 그대로 적용되며 작업 관련 접근이 비밀 노출을 정당화하지는 않습니다.
+- **응답성을 위한 위임**: MainSession은 통합 자식 수명 관리·진행 상황·receipt 보고를 위해 긴 작업에 `delegate_background`를 권장합니다. 유일한 spawner는 아니며 네이티브 task·subagent·job 툴도 사용할 수 있습니다. 적절한 timeout이나 비동기 셸 실행은 작업별 선택입니다. MainSession이 자식 보고를 검토하고 전달하며 백그라운드 worker는 iMessage를 직접 보내지 않습니다.
 
 ## 어시스턴트 작업과 관리형 부작용
 
-`assistant-work/`와 `store/assistant-work.ts`는 작업, 관찰, 정규화된 액션 리비전, 승인, 실행 시도, 후속 정책, 소유자 알림을 내구성 있게 기록합니다. `assistant_work_observe`는 `system` 또는 `third_party` 출처만 받습니다. 호스트 평가가 무시할 근거, 불확실한 제안, 추적할 명확한 미완료 작업을 가르지만 관찰 자체는 어떤 부작용도 승인하지 않습니다. `assistant_service_monitor`는 명확한 경우만 중요/진행 중이면 5분, 그 외에는 45분 주기의 서비스 중립적 읽기 전용 모니터로 만들 수 있습니다. 이 읽기 전용 규칙은 협력적 정책이지 OS 수준 격리가 아닙니다.
+`assistant-work/`와 `store/assistant-work.ts`는 작업, 관찰, 정규화된 액션 리비전, 실행 시도, 후속 정책, 소유자 알림을 내구성 있게 기록합니다. `assistant_work_observe`는 `system` 또는 `third_party` 출처만 받습니다. 호스트 평가가 무시할 근거, 불확실한 제안, 추적할 명확한 미완료 작업을 가르지만 관찰을 소유자 지시로 바꾸지는 않습니다. `assistant_service_monitor`는 명확한 경우만 중요/진행 중이면 5분, 그 외에는 45분 주기의 서비스 중립적 읽기 전용 모니터로 만들 수 있습니다. 이 읽기 전용 규칙은 협력적 정책이지 OS 수준 격리가 아닙니다.
 
-등록된 관리형 경로는 다음과 같습니다.
+선택적 관리형 경로는 다음과 같습니다.
 
 - `assistant_local_file`: 정규화된 절대 경로의 일반 파일 쓰기와 명시적 삭제를 제안/실행합니다. 호스트가 대상 인벤토리를 읽고 부작용 등급을 계산합니다.
-- `assistant_managed_install`: 절대 작업 디렉터리에 정확한 버전의 Bun 패키지 하나를 제안/설치합니다. 호스트가 Bun 경로와 argv를 소유하고, 기본적으로 lifecycle script를 끄며, 한 번의 spawn 전후를 다시 검사합니다.
+- `assistant_managed_install`: 절대 작업 디렉터리에 정확한 버전의 Bun 패키지 하나를 제안/설치합니다. 호스트가 Bun 경로와 argv를 소유하고, 기본값 `ignoreScripts=false`로 정상적인 패키지 lifecycle 동작을 사용하며, 한 번의 spawn 전후를 다시 검사합니다.
 - `assistant_managed_http`: 제한된 GET을 읽거나 정확한 POST/PUT/PATCH/DELETE 하나를 제안/실행합니다. 변경 요청은 redirect와 자동 재시도 없이 한 번만 실행하고 별도 GET으로 기대 상태를 검증합니다.
-- `assistant_work_status`: 작업, 액션 ID/리비전/digest, 시도 상태를 읽기만 하며 승인이나 실행은 하지 않습니다.
+- `assistant_work_status`: 작업, 액션 ID/리비전/digest, 시도 상태를 읽기만 하며 실행은 하지 않습니다.
 
-SDK 관리형 gate는 메인과 자식 세션의 raw `bash`, 변경형 browser 호출, 알 수 없는 툴 부작용도 가로챕니다. raw `write`/`edit`는 `assistant_local_file`로 유도합니다. 관리형 실행이 제공되는 세션에서는 그 밖의 raw 부작용을 정확한 툴 이름과 정규 입력 digest에 묶고, 소유자의 정확한 승인을 받은 뒤 `effect_started`를 먼저 기록하고 SDK 툴을 한 번 실행합니다. 툴 결과는 실행 근거일 뿐 독립 검증이 아니므로 성공처럼 꾸미지 않고 `ambiguous`로 끝냅니다. 관찰 전용 모니터 자식은 이런 부작용을 fail-closed로 막습니다. 이는 실제 툴 호출에 연결된 협력적 gate이지 셸/브라우저 전체를 가두는 sandbox가 아닙니다.
+메인과 백그라운드 세션은 소유자 작업을 raw 셸·파일·브라우저 등 사용 가능한 툴로 바로 실행하며 작업별 확인이나 관리형 툴로의 강제 전환은 없습니다. 관리형 툴은 내구성 있는 사전 점검과 효과 검증을 위한 선택적 경로입니다. 툴 결과는 실행 근거이지 독립 검증은 아니므로 불확실한 효과를 검증된 성공으로 말하지 않고, 재시도 전에 중복 효과를 확인합니다.
 
-모든 제안은 액션 ID, 양의 정수 리비전, 정규 SHA-256 digest로 식별됩니다. 실행은 같은 세 값을 제출해야 합니다. 관리형 executor는 claim 직전과 변경 직전에 호스트 상태를 다시 검사하고, 실제 부작용 전에 `effect_started`를 영속화하며, 검증 근거로 종료 상태를 기록합니다. 일반 로컬 편집과 확인된 전용 관리형 설치 루트는 로컬 정책으로 실행할 수 있습니다. 기존 파일 삭제, 사용자 자산 일괄 변경, 코어/계정 변경, lifecycle script, HTTP 변경, opaque raw 부작용은 정확한 소유자 권한이 없으면 차단됩니다. 단, external message로 분류된 HTTP 액션은 recipient/topic/action이 모두 정확히 일치하는 활성 소유자 규칙으로도 승인될 수 있습니다.
+새 관리형 액션은 `planned`로 시작하며 액션 ID, 양의 정수 리비전, 정규 SHA-256 digest로 식별됩니다. 실행은 같은 세 값을 제출해야 합니다. 관리형 executor는 claim 직전과 변경 직전에 호스트 상태를 다시 검사하고, 실제 부작용 전에 `effect_started`를 영속화하며, 검증 근거로 종료 상태를 기록합니다. 이 검사는 데이터 무결성과 취소를 보존하는 절차이지 애플리케이션 허가 교환이 아닙니다. 불확실한 실행 후 결과는 조정 대상이며 맹목적으로 재실행하지 않습니다.
 
-`OwnerTurnIngress`만 로컬 Chat 소켓 또는 설정된 iMessage allowlist를 통과한 직접 소유자 메시지에서 권한을 만듭니다. 액션 승인/거절 명령은 첨부나 인용 없이 아래 한 줄 그대로여야 합니다.
+`OwnerTurnIngress`는 로컬 Chat 소켓 또는 설정된 iMessage allowlist를 통해 직접 소유자 메시지를 인증합니다. 정확한 취소 명령은 첨부나 인용 없이 아래 한 줄 그대로여야 합니다.
 
 ```text
-/approve ACTION_ID REVISION DIGEST
 /reject ACTION_ID REVISION DIGEST
 ```
 
-`DIGEST`는 소문자 16진수 64자입니다. 알 수 없는 액션, 낡은 리비전/digest, 추가 문구는 거부됩니다. 승인 인식은 관리형 local-file 액션을 식별하고, 저장된 install/HTTP/opaque payload 구조를 검증합니다. 웹페이지, 메시지, 모니터, 자식, 메모리, 툴 출력, 모델의 판단은 소유자 승인이 아닙니다. `/reject`는 해당 현재 리비전을 실행하지 않고 취소합니다. `/approve`는 정확한 승인 하나를 기록한 뒤 직접 소유자 명령을 MainSession에 넘깁니다. 모델은 같은 ID/리비전/digest로 해당 관리형 executor를 호출하거나, opaque 액션이면 동일한 raw 툴 입력을 딱 한 번 다시 시도해야 합니다. 완료 여부는 명령 자체가 아니라 내구성 있는 executor 결과로만 결정됩니다.
-
-외부 메시지의 재사용 가능한 규칙은 첨부 없는 독립된 한 줄의 정확한 명령을 씁니다.
-
-```text
-/allow-send {"recipient":"…","topic":"…","action":"…"}
-/revoke-send RULE_ID REVISION
-```
-
-JSON에는 wildcard 없이 정확히 세 필드만 허용됩니다. 규칙은 그 recipient/topic/action 조합만 승인하며 다른 계정이나 부작용에는 적용되지 않습니다. revoke는 리비전 펜싱을 거치며 이후 claim을 막습니다. 메시지가 아닌 HTTP 변경과 opaque raw 부작용은 계속 액션별 `/approve`가 필요합니다.
+`DIGEST`는 소문자 16진수 64자입니다. 알 수 없는 액션, 낡은 리비전/digest, 추가 문구는 거부됩니다. `/reject`는 해당 현재 리비전을 새 효과 없이 취소하지만 이미 시작된 효과를 되돌리지 않습니다. 웹페이지, 메시지, 모니터, 자식 보고, 메모리, 툴 출력, 모델의 판단은 근거이지 인증된 소유자 지시가 아닙니다. 완료는 명령 접수나 관찰된 출력이 아니라 검증된 효과로 판단합니다.
 
 ### 후속 정책과 복구
 
@@ -117,7 +108,7 @@ JSON에는 wildcard 없이 정확히 세 필드만 허용됩니다. 규칙은 �
 /followup {"workId":"…","actionId":"…","enabled":true,"intervalMs":60000,"maxAttempts":1}
 ```
 
-다섯 필드는 모두 필수이고 추가 필드는 거부됩니다. 정책은 액션의 현재 리비전과 digest를 캡처하며, 비활성 또는 `maxAttempts: 0`이면 예약하지 않습니다. 명령 자체는 액션을 즉시 실행하지 않고, 원본 액션이 `confirmed`가 된 뒤에만 due 실행이 진행됩니다. 런타임은 활성 정책을 폴링하고 ordinal마다 새 semantic action을 만들며, 현재 권한·deadline·work 상태·시도 상한을 다시 확인한 뒤 저장된 payload가 가리키는 실제 local-file/install/HTTP executor를 사용합니다. 정책이나 원본 액션이 바뀌면 이전 경로를 멈추고, `ambiguous` 또는 거절 결과면 이후 반복을 중단합니다. 승인이 필요한 파생 액션은 그 정확한 액션이 승인될 때까지 due 상태로 남습니다.
+다섯 필드는 모두 필수이고 추가 필드는 거부됩니다. 정책은 액션의 현재 리비전과 digest를 캡처하며, 비활성 또는 `maxAttempts: 0`이면 예약하지 않습니다. 명령 자체는 액션을 즉시 실행하지 않고, 원본 액션이 `confirmed`가 된 뒤에만 due 실행이 진행됩니다. 런타임은 활성 정책을 폴링하고 ordinal마다 새 `planned` 액션을 만들며, 현재 정책·deadline·work 상태·시도 상한을 다시 확인한 뒤 저장된 payload가 가리키는 실제 local-file/install/HTTP executor를 사용합니다. 정책이나 원본 액션이 바뀌면 이전 경로를 멈추고, `ambiguous` 또는 취소 결과면 이후 반복을 중단합니다. 파생 액션은 작업별 확인 없이 진행합니다.
 
 `AssistantWorkRuntime`은 부팅 시에도 복구합니다. 지원되는 local-file/install/HTTP 액션의 `claimed_pre_effect` 시도는 실제 executor로 재개할 수 있지만, 중단된 `effect_started` 시도는 reconcile-only/`ambiguous`로 표시하고 재실행하지 않습니다. 영속 복구 보고는 소유자 알림 전에 MainSession 내부 턴을 거치며 가짜 성공을 만들지 않습니다. 완료는 정책 저장이나 큐 등록이 아니라 검증된 executor 결과와 실제 사용 경로의 수용 증거로 판단합니다.
 
@@ -165,7 +156,7 @@ SQLite나 자식 SDK 세션에 들어가지 않는다. latency alert threshold�
 steer 또는 메인 내부 turn으로 주입된다.
 
 모든 자식 kind의 실패와 재시작 orphan은 interim 배치를 건너뛰고 내구성 receipt가
-됩니다. 모든 receipt는 영속 MainSession의 내부 triage turn으로 먼저 갑니다. 대화형·사전 텍스트는 MainSession이 작성하고, 인증된 host 경로는 `/approve`·`/reject` 같은 결정적 명령 결과를 반환할 수 있습니다. background worker는 iMessage를 직접 보내지 않습니다. 메인 에이전트는 retry/resume/redelegate/repair/정리/침묵을 선택할 수 있고, 소유자의 판단이 필요할 때만 간결한 자연어 한 줄을 보냅니다. 원시 state 토큰, provider error code, stack, 경로와 receipt projection은 내부 근거로만 남으며 소유자에게 절대 가지 않습니다.
+됩니다. 모든 receipt는 영속 MainSession의 내부 triage turn으로 먼저 갑니다. 대화형·사전 텍스트는 MainSession이 작성하고, 인증된 host 경로는 `/reject`·`/followup` 같은 결정적 명령 결과를 반환할 수 있습니다. background worker는 iMessage를 직접 보내지 않습니다. 메인 에이전트는 retry/resume/redelegate/repair/정리/침묵을 선택할 수 있고, 소유자의 판단이 필요할 때만 간결한 자연어 한 줄을 보냅니다. 원시 state 토큰, provider error code, stack, 경로와 receipt projection은 내부 근거로만 남으며 소유자에게 절대 가지 않습니다.
 ## 모니터
 
 `monitors/store.ts`가 리비전 펜싱과 함께 스펙을 `state.db`에 보관. 트리거: `cron`(IANA tz, 명시적 DST 규칙), `watcher`(파일 루트), `webhook`(토큰), `script`(간격, 스크립트 루트만). 선택적 `expiresAt`이 만료 시 모니터를 끔. `memory-canonicalize`, `memory-audit`, `computer-usage-insight`는 한 번 시드되고 앞의 둘은 보호됨.
@@ -216,4 +207,4 @@ Account 탭도 OAuth/API 키 계정을 나열하고, 기존 CLI 자격 증명에
 - 브라우저는 에이전트 전용 Chrome 프로파일에서만(권고가 아닌 강제).
 - iMessage로 묶인 부작용은 내구성 있고 멱등적인 전송 원장 행으로 남고, Chat 허브 이벤트는 fire-and-forget으로 seq를 붙여 전달됩니다.
 - system/third-party 관찰은 읽기 전용 추적을 제안하거나 예약할 수 있지만 소유자 출처를 만들거나 변경을 승인하지 못합니다.
-- 관리형 부작용은 호스트 분류, 정확한 리비전/digest 펜싱, 실행 전 영속화, 사후 검증을 사용합니다. 이는 실제 SDK 호출에 연결된 협력적 gate이지 전체 프로세스의 hard sandbox 주장이 아닙니다.
+- 선택적 관리형 효과는 호스트 사전 점검, 정확한 리비전/digest 펜싱, 취소, 실행 기록, 효과 검증을 사용합니다. raw 툴은 직접 사용할 수 있고 OS 권한은 macOS가 별도로 적용합니다.

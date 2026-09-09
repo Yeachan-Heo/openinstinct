@@ -410,7 +410,7 @@ export function createManagedHttpTool(options: ManagedHttpToolOptions): CustomTo
     label: "Managed HTTP",
     strict: true,
     concurrency: "exclusive",
-    description: "Read one trusted-policy HTTP(S) endpoint with GET, or propose/execute one exact POST, PUT, PATCH, or DELETE action. Host code derives the effect class. Mutations require durable authorization and a separate GET verification; redirects and blind retries are disabled. Credentials use host-resolved secret header references, never plaintext header values.",
+    description: "Read one policy-validated HTTP(S) endpoint with GET, or propose/execute one exact POST, PUT, PATCH, or DELETE action. Execute planned mutations immediately; a separate GET verifies the result. Redirects and blind retries are disabled. Credentials use host-resolved secret header references, never plaintext header values.",
     parameters: Type.Object({
       operation: Type.Enum(["get", "propose", "execute"]),
       url: Type.Optional(Type.String({ minLength: 1, maxLength: 8_192 })),
@@ -494,7 +494,7 @@ export function createManagedHttpTool(options: ManagedHttpToolOptions): CustomTo
         now: () => now().toISOString(),
       });
       return {
-        content: [{ type: "text" as const, text: executionText(result, actionId, revision, digest) }],
+        content: [{ type: "text" as const, text: executionText(result, actionId, revision) }],
         details: executionDetails(result, attemptId),
       };
     },
@@ -1897,17 +1897,13 @@ function readResultText(result: ObserveManagedHttpResult): string {
 
 function proposalText(action: ActionRecord): string {
   const identity = `action ${action.id} revision ${action.revision} digest ${action.digest}`;
-  if (action.effectClass === "external_message") {
-    return `Prepared external message ${identity}. No request has run. Execute assistant_managed_http with this exact actionId, revision, and digest; dispatch requires a matching owner message rule or exact owner approval.`;
-  }
-  return `Explicit approval required for ${identity}. No request has run. Send exactly: /approve ${action.id} ${action.revision} ${action.digest}`;
+  return `Recorded ${identity} in state ${action.state}. This proposal invoked no request. If planned, execute assistant_managed_http immediately with this exact actionId, revision, and digest.`;
 }
 
 function executionText(
   result: ManagedHttpExecutionResult,
   actionId: string,
   revision: number,
-  digest: string,
 ): string {
   if (result.kind === "confirmed") {
     return `Confirmed action ${actionId} revision ${revision}. One mutation request ran and the separate GET verification proved the expected remote state.`;
@@ -1922,9 +1918,6 @@ function executionText(
     return `Did not dispatch action ${actionId} revision ${revision}: ${result.message}. Re-propose from current trusted endpoint policy.`;
   }
   if (result.kind === "rejected") {
-    if (result.reason === "approval_required") {
-      return `Authorization required for action ${actionId} revision ${revision} digest ${digest}. No request has run. External mutations need exact owner approval; external messages may also use an exact recipient/topic/action owner rule.`;
-    }
     return `Did not dispatch action ${actionId} revision ${revision}: ${result.reason}. No new request was invoked.`;
   }
   return assertNever(result);
@@ -1985,7 +1978,6 @@ function attemptSummary(attempt: AttemptRecord): Record<string, unknown> {
     actionRevision: attempt.actionRevision,
     actionDigest: attempt.actionDigest,
     state: attempt.state,
-    authorizationSource: attempt.authorizationSource,
     claimedAt: attempt.claimedAt,
     ...(attempt.effectStartedAt === undefined ? {} : { effectStartedAt: attempt.effectStartedAt }),
     ...(attempt.settledAt === undefined ? {} : { settledAt: attempt.settledAt }),

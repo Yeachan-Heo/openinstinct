@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -118,25 +119,24 @@ describe("managed user-local Bun installation", () => {
         destination,
         bunPath: FIXTURE,
       });
-      expect(preflight.effectClass).toBe("ordinary_local_install");
+      expect(preflight.effectClass).toBe("external_mutation");
       expect(preflight.argv).toEqual([
         FIXTURE,
         "add",
         "--exact",
-        "--ignore-scripts",
         "--cwd",
         destination,
         "@scope/fixture-tool@1.2.3",
       ]);
       expect(preflight.proposal).toMatchObject({
-        effectClass: "ordinary_local_install",
+        effectClass: "external_mutation",
         action: MANAGED_INSTALL_ACTION,
         payload: {
           manager: "bun",
           managerPath: FIXTURE,
           packageSpec: "@scope/fixture-tool@1.2.3",
           destination,
-          options: { exact: true, ignoreScripts: true },
+          options: { exact: true, ignoreScripts: false },
         },
       });
       const changedPackage = await preflightManagedInstall({
@@ -152,7 +152,7 @@ describe("managed user-local Bun installation", () => {
         packageSpec: "@scope/fixture-tool@1.2.3",
         destination,
         bunPath: FIXTURE,
-        ignoreScripts: false,
+        ignoreScripts: true,
       });
       const changedDestination = await preflightManagedInstall({
         workId: work.id,
@@ -177,9 +177,9 @@ describe("managed user-local Bun installation", () => {
       const fourth = store.assistantWork.proposeAction(changedDestination.proposal, T2);
       const fifth = store.assistantWork.proposeAction(changedManager.proposal, T2);
       expect(new Set([first.digest, second.digest, third.digest, fourth.digest, fifth.digest]).size).toBe(5);
-      expect(changedOptions.effectClass).toBe("external_mutation");
-      expect(changedOptions.argv).not.toContain("--ignore-scripts");
-      expect(third.state).toBe("approval_pending");
+      expect(changedOptions.effectClass).toBe("ordinary_local_install");
+      expect(changedOptions.argv).toContain("--ignore-scripts");
+      expect(third.state).toBe("planned");
     } finally {
       store.close();
     }
@@ -282,15 +282,16 @@ describe("managed user-local Bun installation", () => {
     }
   });
 
-  test("requires approval for an existing mixed work directory and classifies core paths host-side", async () => {
+  test("installs into an existing mixed work directory and classifies core paths host-side", async () => {
     chmodSync(FIXTURE, 0o700);
     const path = root();
     const mixed = join(path, "project");
     mkdirSync(mixed);
     writeFileSync(join(mixed, "user-notes.txt"), "keep", "utf8");
+    writeFileSync(join(mixed, "package.json"), JSON.stringify({ private: true }), "utf8");
     const store = storeAt(path);
     try {
-      const work = admitWork(store, "approval");
+      const work = admitWork(store, "mixed-project");
       const existing = await preflightManagedInstall({
         workId: work.id,
         semanticKey: "mixed-project",
@@ -298,21 +299,23 @@ describe("managed user-local Bun installation", () => {
         destination: mixed,
         bunPath: FIXTURE,
       });
-      expect(existing.effectClass).toBe("bulk_existing_user_assets");
+      expect(existing.effectClass).toBe("external_mutation");
       const action = store.assistantWork.proposeAction(existing.proposal, T0);
-      expect(action.state).toBe("approval_pending");
+      expect(action.state).toBe("planned");
       await expect(executeManagedInstall({
         repository: store.assistantWork,
         actionId: action.id,
         revision: action.revision,
         digest: action.digest,
-        attemptId: stableAttemptId(action.id, action.revision, "not-approved"),
+        attemptId: stableAttemptId(action.id, action.revision, "immediate-mixed-install"),
         workerId: "install-worker",
         bunPath: FIXTURE,
         env: installEnv(path),
         now: () => T1,
-      })).resolves.toMatchObject({ kind: "rejected", reason: "approval_required" });
-      expect(existsSync(join(path, "manager.argv.jsonl"))).toBe(false);
+      })).resolves.toMatchObject({ kind: "confirmed", attempt: { state: "confirmed" } });
+      expect(parseArgvLog(path)).toEqual([existing.argv.slice(1)]);
+      expect(parseArgvLog(path)[0]).not.toContain("--ignore-scripts");
+      expect(readFileSync(join(mixed, "node_modules", "fixture-tool", "installed.txt"), "utf8")).toBe("fixture install evidence\n");
       expect(readFileSync(join(mixed, "user-notes.txt"), "utf8")).toBe("keep");
 
       const modelLabeled = join(path, "model-labeled-tools");
@@ -327,6 +330,7 @@ describe("managed user-local Bun installation", () => {
         packageSpec: "fixture-tool@1.2.3",
         destination: modelLabeled,
         bunPath: FIXTURE,
+        ignoreScripts: true,
         repository: store.assistantWork,
       });
       expect(labeled.effectClass).toBe("bulk_existing_user_assets");
@@ -370,7 +374,7 @@ describe("managed user-local Bun installation", () => {
       });
       expect(accountRights.effectClass).toBe("account_rights_change");
       const accountAction = store.assistantWork.proposeAction(accountRights.proposal, T2);
-      expect(accountAction.state).toBe("approval_pending");
+      expect(accountAction.state).toBe("planned");
 
       const sshRoot = join(path, ".ssh", "authorized_keys");
       mkdirSync(sshRoot, { recursive: true });
@@ -393,8 +397,8 @@ describe("managed user-local Bun installation", () => {
     const destination = join(path, "installed-tools");
     const store = storeAt(path);
     try {
-      const { preflight, action } = await propose(store, path, "installed", { destination });
-      expect(action).toMatchObject({ state: "authorized", effectClass: "ordinary_local_install" });
+      const { preflight, action } = await propose(store, path, "installed", { destination, ignoreScripts: true });
+      expect(action).toMatchObject({ state: "planned", effectClass: "ordinary_local_install" });
       const attemptId = stableAttemptId(action.id, action.revision, "install-once");
       const result = await executeManagedInstall({
         repository: store.assistantWork,
@@ -436,6 +440,7 @@ describe("managed user-local Bun installation", () => {
         packageSpec: "second-fixture-tool@2.0.0",
         destination,
         bunPath: FIXTURE,
+        ignoreScripts: true,
       });
       expect(withoutLedger.effectClass).toBe("bulk_existing_user_assets");
       const secondPackage = await preflightManagedInstall({
@@ -444,6 +449,7 @@ describe("managed user-local Bun installation", () => {
         packageSpec: "second-fixture-tool@2.0.0",
         destination,
         bunPath: FIXTURE,
+        ignoreScripts: true,
         repository: store.assistantWork,
       });
       expect(secondPackage).toMatchObject({
@@ -476,7 +482,7 @@ describe("managed user-local Bun installation", () => {
     const path = root();
     const store = storeAt(path);
     try {
-      const { action } = await propose(store, path, "failed-clean");
+      const { action } = await propose(store, path, "failed-clean", { ignoreScripts: true });
       const attemptId = stableAttemptId(action.id, action.revision, "failed-clean");
       const result = await executeManagedInstall({
         repository: store.assistantWork,
@@ -562,7 +568,7 @@ describe("managed user-local Bun installation", () => {
     const controller = new AbortController();
     let execution: ReturnType<typeof executeManagedInstall> | undefined;
     try {
-      const { action } = await propose(store, path, "cancelled", { destination });
+      const { action } = await propose(store, path, "cancelled", { destination, ignoreScripts: true });
       execution = executeManagedInstall({
         repository: store.assistantWork,
         actionId: action.id,
@@ -652,7 +658,7 @@ describe("managed user-local Bun installation", () => {
         packageSpec: "fixture-tool@1.2.3",
         destination: join(path, "tool-api-tools"),
       } as never, undefined, {} as never)).resolves.toMatchObject({
-        details: { operation: "propose", effectExecuted: false, action: { state: "authorized" } },
+        details: { operation: "propose", effectExecuted: false, action: { state: "planned" } },
       });
       await expect(tool.execute("bad-execute", {
         operation: "execute",
@@ -665,4 +671,38 @@ describe("managed user-local Bun installation", () => {
       store.close();
     }
   });
+});
+
+test("reopened dedicated-root preflight ignores unrelated obsolete action states", async () => {
+  chmodSync(FIXTURE, 0o700);
+  const path = root();
+  const destination = join(path, "recognized-tools");
+  const initial = storeAt(path);
+  const { action } = await propose(initial, path, "recognized", { destination, ignoreScripts: true });
+  const unrelated = await propose(initial, path, "obsolete-unrelated");
+  try {
+    expect(await executeManagedInstall({
+      repository: initial.assistantWork, actionId: action.id, revision: action.revision, digest: action.digest,
+      attemptId: stableAttemptId(action.id, action.revision, "recognized-install"), workerId: "install-worker",
+      bunPath: FIXTURE, env: installEnv(path), now: () => T1,
+    })).toMatchObject({ kind: "confirmed" });
+  } finally { initial.close(); }
+  const db = new Database(join(path, "state.db"));
+  try { db.query("UPDATE assistant_work_actions SET state = 'approval_pending' WHERE id = ?").run(unrelated.action.id); }
+  finally { db.close(); }
+  const reopened = storeAt(path);
+  try {
+    const listing = reopened.assistantWork.listActions();
+    expect(listing.actions).toContainEqual(expect.objectContaining({ id: action.id, state: "confirmed" }));
+    expect(listing.unsupported).toMatchObject([{ actionId: unrelated.action.id, state: "approval_pending" }]);
+    const next = await preflightManagedInstall({
+      workId: action.workId, semanticKey: "recognized-next", packageSpec: "second-fixture-tool@2.0.0",
+      destination, bunPath: FIXTURE, ignoreScripts: true, repository: reopened.assistantWork,
+    });
+    expect(next).toMatchObject({ effectClass: "ordinary_local_install", inventory: { dedicatedToolRoot: true, existing: true } });
+    expect(readFileSync(join(destination, "node_modules", "fixture-tool", "installed.txt"), "utf8")).toBe("fixture install evidence\n");
+    expect(parseArgvLog(path)).toHaveLength(1);
+    expect(reopened.assistantWork.listAttempts(unrelated.action.id)).toHaveLength(0);
+    expect(existsSync(unrelated.preflight.plan.destination)).toBe(false);
+  } finally { reopened.close(); }
 });

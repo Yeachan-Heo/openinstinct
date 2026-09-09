@@ -133,7 +133,7 @@ export class FollowupRecoveryService {
     const attemptId = claim.action.activeAttemptId ?? stableAttemptId(claim.action.id, claim.action.revision, claim.dispatch.id);
     const result = await this.invoke(claim.action, attemptId);
     const outcome = result.kind === "rejected"
-      ? { kind: result.reason === "approval_required" ? "approval_required" as const : "rejected" as const, detail: { reason: result.reason } }
+      ? { kind: "rejected" as const, detail: { reason: result.reason } }
       : { kind: result.kind, detail: result.evidence };
     const report = followupReport(claim.dispatch.id, claim.policy.workId, claim.action.id, outcome);
     const completed = this.options.repository.completeFollowup(

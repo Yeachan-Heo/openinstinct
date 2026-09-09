@@ -48,9 +48,9 @@ describe("main iMessage gate", () => {
       reprobeIntervalMs: 60_000,
     });
     try {
-      expect(runtime.status()).toMatchObject({ state: "running" });
+      expect(runtime.status()).toMatchObject({ state: "running", probes: { fda: { status: "passed" } } });
 
-      expect(fdaCalls).toBe(0);
+      expect(fdaCalls).toBeGreaterThan(0);
       expect(runtime.store.getChatCursor()).toBeUndefined();
       expect(existsSync(chatDbPath)).toBe(false);
     } finally {

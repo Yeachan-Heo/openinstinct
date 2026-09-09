@@ -7,12 +7,7 @@ import { dispatchManagedAction } from "../../src/assistant-work/dispatch.ts";
 import { configuredHttpAccess } from "../../src/assistant-work/http-policy.ts";
 import { preflightManagedHttpAction } from "../../src/assistant-work/http-effects.ts";
 import { preflightLocalFileAction } from "../../src/assistant-work/local-effects.ts";
-import { stableAttemptId, type ActionRecord } from "../../src/assistant-work/model.ts";
-import { ChatHub, PANEL_SOURCE_MARKER } from "../../src/chat/hub.ts";
-import { OwnerOutbox } from "../../src/delivery/outbox.ts";
-import { NdjsonLogger } from "../../src/log.ts";
-import { OwnerTurnIngress, type OwnerTurnRequest } from "../../src/owner-turn.ts";
-import type { MainSession, MainTurnInput } from "../../src/sdk-session/main-session.ts";
+import { stableAttemptId } from "../../src/assistant-work/model.ts";
 import { openStateStore, type StateStore } from "../../src/store/index.ts";
 import {
   HttpServiceFixture,
@@ -26,7 +21,6 @@ const T0 = "2026-09-05T12:00:00.000Z";
 interface DispatchHarness {
   readonly root: string;
   readonly store: StateStore;
-  readonly ingress: OwnerTurnIngress;
 }
 
 afterEach(async () => {
@@ -44,25 +38,7 @@ function createHarness(): DispatchHarness {
   const root = mkdtempSync(join(tmpdir(), "openinstinct-dispatch-integration-"));
   roots.push(root);
   const store = openStateStore(join(root, "state.db"));
-  const logger = new NdjsonLogger(join(root, "dispatch.ndjson"));
-  const hub = new ChatHub(logger);
-  const outbox = new OwnerOutbox({ logger });
-  const lane = {
-    session: {
-      running: false,
-      turn: (_input: MainTurnInput) => Promise.resolve({ kind: "reply", text: "dispatch approval admitted" } as const),
-      steer: () => Promise.resolve({ kind: "not_admitted", reason: "idle" } as const),
-    } as unknown as MainSession,
-  };
-  const ingress = new OwnerTurnIngress({
-    store,
-    logger,
-    hub,
-    outbox,
-    lanes: () => lane,
-    transcript: () => [],
-  });
-  return { root, store, ingress };
+  return { root, store };
 }
 
 function admitWork(store: StateStore, suffix: string) {
@@ -82,15 +58,6 @@ function admitWork(store: StateStore, suffix: string) {
   }, T0).work;
 }
 
-function ownerRequest(turnId: string, action: ActionRecord): OwnerTurnRequest {
-  const text = `/approve ${action.id} ${action.revision} ${action.digest}`;
-  return {
-    source: "panel",
-    turnId,
-    text,
-    promptText: `${text}\n\n${PANEL_SOURCE_MARKER}`,
-  };
-}
 
 describe("managed executor dispatch selection", () => {
   test("selects local and HTTP executors from persisted action material without invoking the wrong effect", async () => {
@@ -110,9 +77,7 @@ describe("managed executor dispatch selection", () => {
         operations: [{ operation: "delete_file", path: localPath }],
       });
       const localAction = harness.store.assistantWork.proposeAction(localPreflight.proposal, T0);
-      expect(localAction).toMatchObject({ state: "approval_pending", effectClass: "delete_existing" });
-      expect(await harness.ingress.admit(ownerRequest("approve-dispatch-local", localAction))).toBe("started");
-      expect(harness.store.assistantWork.getAction(localAction.id)).toMatchObject({ state: "authorized" });
+      expect(localAction).toMatchObject({ state: "planned", effectClass: "delete_existing" });
 
       const httpWork = admitWork(harness.store, "http");
       const httpPreflight = await preflightManagedHttpAction({
@@ -132,9 +97,7 @@ describe("managed executor dispatch selection", () => {
         },
       }, { endpointPolicy: access.endpointPolicy });
       const httpAction = harness.store.assistantWork.proposeAction(httpPreflight.proposal, T0);
-      expect(httpAction).toMatchObject({ state: "approval_pending", effectClass: "external_mutation" });
-      expect(await harness.ingress.admit(ownerRequest("approve-dispatch-http", httpAction))).toBe("started");
-      expect(harness.store.assistantWork.getAction(httpAction.id)).toMatchObject({ state: "authorized" });
+      expect(httpAction).toMatchObject({ state: "planned", effectClass: "external_mutation" });
 
       const localAttemptId = stableAttemptId(localAction.id, localAction.revision, "dispatch-local");
       const localResult = await dispatchManagedAction({
@@ -147,7 +110,7 @@ describe("managed executor dispatch selection", () => {
       expect(localResult).toMatchObject({
         kind: "confirmed",
         action: { id: localAction.id, state: "confirmed" },
-        attempt: { id: localAttemptId, state: "confirmed", authorizationSource: "owner_explicit" },
+        attempt: { id: localAttemptId, state: "confirmed" },
         evidence: { kind: "managed_local_file_receipt" },
       });
       expect(existsSync(localPath)).toBe(false);
@@ -165,7 +128,7 @@ describe("managed executor dispatch selection", () => {
       expect(httpResult).toMatchObject({
         kind: "confirmed",
         action: { id: httpAction.id, state: "confirmed" },
-        attempt: { id: httpAttemptId, state: "confirmed", authorizationSource: "owner_explicit" },
+        attempt: { id: httpAttemptId, state: "confirmed" },
         evidence: {
           kind: "managed_http_verification",
           code: "http_effect_verified",
@@ -191,8 +154,6 @@ describe("managed executor dispatch selection", () => {
         state: "confirmed",
         outcome: { kind: "managed_http_verification", code: "http_effect_verified" },
       });
-      expect(harness.store.assistantWork.listExplicitApprovals(localAction.id)).toMatchObject([{ state: "consumed" }]);
-      expect(harness.store.assistantWork.listExplicitApprovals(httpAction.id)).toMatchObject([{ state: "consumed" }]);
       expect(harness.store.assistantWork.listAttempts(localAction.id)).toHaveLength(1);
       expect(harness.store.assistantWork.listAttempts(httpAction.id)).toHaveLength(1);
     } finally {
@@ -222,8 +183,6 @@ describe("managed executor dispatch selection", () => {
           body: { selected: "none" },
         },
       }, T0);
-      expect(await harness.ingress.admit(ownerRequest("approve-unsupported-dispatch", unsupported))).toBe("command");
-      expect(harness.store.assistantWork.listExplicitApprovals(unsupported.id)).toHaveLength(0);
 
       const result = await dispatchManagedAction({
         repository: harness.store.assistantWork,

@@ -48,7 +48,7 @@ function isPassed(probe: ProbeResult): boolean {
   return probe.status === "passed";
 }
 
-/** Evaluates core credentials and optional iMessage permission probes. */
+/** Evaluates core credentials, baseline FDA, and optional iMessage probes. */
 export class BootstrapMachine {
   private current: BootstrapSnapshot = {
     state: "starting",
@@ -67,21 +67,28 @@ export class BootstrapMachine {
       const credentials = this.probes.credentials === undefined
         ? { status: "passed" as const }
         : await this.probes.credentials();
+      let fda: ProbeResult;
+      try {
+        fda = await this.probes.fda();
+      } catch (error) {
+        fda = {
+          status: "error",
+          reason: error instanceof Error ? error.message : "Full Disk Access probe failed",
+        };
+      }
       if (credentials.status === "missing") {
         return this.set({
           state: "credentials_blocked",
-          probes: { config, credentials },
+          probes: { config, credentials, fda },
           reason: credentials.reason,
         });
       }
 
       let messages: ProbeResult | undefined;
-      let fda: ProbeResult | undefined;
       let accessibility: ProbeResult | undefined;
       if (config.allowlistHandle !== undefined) {
-        [messages, fda, accessibility] = await Promise.all([
+        [messages, accessibility] = await Promise.all([
           this.probes.messages?.() ?? Promise.resolve(undefined),
-          this.probes.fda(),
           this.probes.accessibility(),
         ]);
       }
@@ -90,16 +97,17 @@ export class BootstrapMachine {
         config,
         credentials,
         ...(messages === undefined ? {} : { messages }),
-        ...(fda === undefined ? {} : { fda }),
+        fda,
         ...(accessibility === undefined ? {} : { accessibility }),
       };
-      const reason = config.status !== "passed"
-        ? config.reason
-        : accessibility !== undefined && !isPassed(accessibility)
-          ? accessibility.reason
-          : messages?.status === "unknown"
-            ? messages.reason
-            : undefined;
+      const reason = [
+        config.status !== "passed" ? config.reason : undefined,
+        !isPassed(fda)
+          ? `OS capabilities are limited: Full Disk Access baseline is not verified (${fda.status}).${fda.reason ? ` ${fda.reason}` : ""} Chat and runtime remain available.`
+          : undefined,
+        accessibility !== undefined && !isPassed(accessibility) ? accessibility.reason : undefined,
+        messages?.status === "unknown" ? messages.reason : undefined,
+      ].filter((detail): detail is string => detail !== undefined).join(" ") || undefined;
       return this.set({
         state: "running",
         probes,

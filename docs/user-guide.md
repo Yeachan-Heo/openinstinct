@@ -36,9 +36,10 @@ own Apple ID.
    unpack it, and run `sh <folder>/scripts/bootstrap-from-payload.sh <folder>`.)
 2. The release archive copies the files and opens the menu-bar panel. Click the
    speech-bubble icon → **Chat…**; sign in under **Settings… → AI account**.
-3. Chat is usable as soon as the AI account is ready. Phone number, Messages
-   identity, Full Disk Access, Automation, and Accessibility are not needed for
-   Chat.
+3. Chat is usable as soon as the AI account is ready. Full Disk Access is a required
+   baseline and is probed even for Chat-only use. Enable the one-time macOS switch
+   in System Settings; Gajae cannot self-grant it or claim access until a real probe
+   passes. Chat keeps running with limited-OS-capability diagnostics while unverified.
 4. To add phone texting later, open **Settings… → iMessage**, enter an owner
    handle, and complete the optional identity and permission prompts. Connecting
    or disconnecting this lane does not restart the shared Chat session.
@@ -53,8 +54,9 @@ The Chat window is a separate window with iMessage-like bubbles and plain text:
 
 1. Click the menu-bar icon → **Chat…**.
 2. Sign in to an AI account or add an API key under **Settings… → AI account**.
-3. Type and send. Chat does not need a phone number, `chat.db`, Full Disk Access,
-   Automation, or Accessibility.
+3. Type and send. Chat does not need a phone number, Messages identity, Automation,
+   or Accessibility. Full Disk Access remains the required baseline, not a per-action
+   prompt or a new Chat execution block.
 
 The composer is blocked only when the daemon cannot be reached, no AI credential
 is available, or Gajae is paused. A detached iMessage lane never blocks Chat.
@@ -95,76 +97,50 @@ its schedule or enabled state.
 Long work comes back as "on it" first, then the result. It never uses Markdown,
 never quotes your message back, and replies in whatever language you text in.
 
-### Managed actions and approval commands
+### Direct execution and optional managed tools
 
-For actions that can change local or remote state, Gajae uses a durable managed
-action instead of treating a model decision as permission. Current paths cover:
+Gajae carries out owner tasks directly with available tools in main and background
+sessions, without per-action confirmation round trips or forced redirection of
+raw shell, file, or browser calls. Owner messages are authenticated through Chat
+or the configured iMessage account; remote content is evidence, not owner instructions.
+Native SDK permission defaults are allow. For longer work, `delegate_background`
+is recommended for integrated lifecycle tracking and MainSession reporting, not
+as the only spawner; native task, subagent, and job tools remain available.
+Responsive delegation and suitable shell timeouts are recommendations, not a fixed
+call budget or application timeout block. There is no application path denylist
+or blanket Discord API prohibition. Read only task-relevant data and do not expose
+secrets. Browser own-profile and child-tab routing remain enforced for account
+identity and collision prevention. MainSession reviews child reports and relays
+results; background children do not send iMessage directly.
 
-- writing a regular file or explicitly deleting a file at an absolute path;
-- installing one exact-version Bun package in an absolute work folder, normally
-  with package lifecycle scripts disabled;
-- bounded HTTP GETs and exact POST, PUT, PATCH, or DELETE requests whose host
-  policy allows the endpoint and whose mutation has a separate GET check;
-- raw shell, mutating browser, and otherwise unknown tool effects, gated to the
-  exact tool input.
+Managed tools are optional durable preflight and verification paths:
 
-Monitors and background checks can also record system or third-party evidence as
-a durable observation. Clear, involved unfinished work may become a read-only
-watch; uncertain evidence stays a proposal for review. An observation, website,
-message, or tool result never counts as your approval to change anything.
+- `assistant_local_file` writes regular files or explicitly deletes absolute paths.
+- `assistant_managed_install` installs one exact-version Bun package in an absolute
+  work folder. `ignoreScripts=false` is the default, using normal package lifecycle behavior.
+- `assistant_managed_http` supports bounded GETs and exact mutations with a separate
+  verification GET and host endpoint/credential policy.
 
-Before a managed action runs, OpenInstinct records an action ID, revision, and
-digest. File, install, and HTTP paths re-check host state or endpoint policy;
-ordinary local edits and recognized managed-tool installs can run under local
-policy. Deletes, existing user assets, core/account changes, install scripts,
-HTTP mutations, and raw effects require exact owner authority or stay blocked.
-The gate is wired to the actual main and background SDK tool calls, but it is
-cooperative workflow inside the daemon, not an OS sandbox.
+New managed actions start as `planned`. Preflight records an action ID, revision,
+and digest; execution uses that exact current identity and rechecks host state.
+These checks protect data integrity, cancellation, and duplicate-effect handling,
+not a per-action permission exchange. Monitors may record system or third-party
+observations and track clear unfinished work read-only; those observations never
+become owner instructions.
 
-When Gajae says explicit approval is required, copy the exact action identity and
-send one standalone, text-only line in Chat or from the configured owner iMessage
-account:
-
-```text
-/approve ACTION_ID REVISION DIGEST
-```
-
-To refuse the current action instead, send:
+To cancel a matching managed action, send one standalone text-only line:
 
 ```text
 /reject ACTION_ID REVISION DIGEST
 ```
 
-Do not add words or attachments. `REVISION` is a positive integer and `DIGEST`
-is 64 lowercase hexadecimal characters. OpenInstinct recognizes the managed
-local-file action and validates the stored install, HTTP, and raw-tool payloads
-before accepting approval. A stale or malformed identity is rejected. `/reject`
-cancels the matching revision without executing it. `/approve` records exactly
-one approval; Gajae then runs the matching managed executor with the same
-identity, or retries the exact unchanged raw tool input once. It reports success
-only after the executor verifies it. A raw tool result has no independent check,
-so it is reported as uncertain/ambiguous instead of fake success and is not
-retried blindly.
+`REVISION` is a positive integer and `DIGEST` is 64 lowercase hexadecimal characters.
+Attachments, extra words, stale revisions, and malformed identities are rejected.
+Cancellation does not undo effects already started. A tool result is execution
+evidence, not necessarily an independently verified effect: report uncertainty
+honestly and check for duplicate effects before retrying.
 
-### Exact send rules and follow-ups
-
-For a managed HTTP action that sends a message, a one-action `/approve` works.
-You can also create a reusable rule for one exact recipient/topic/action tuple:
-
-```text
-/allow-send {"recipient":"…","topic":"…","action":"…"}
-```
-
-Send it as standalone text with no attachment; wildcards and extra fields are
-not allowed. Gajae returns the rule ID and revision;
-revoke future use with:
-
-```text
-/revoke-send RULE_ID REVISION
-```
-
-The rule does not authorize another recipient, topic, action, account, or any
-non-message change.
+### Bounded follow-ups
 
 A bounded follow-up policy repeats an already recorded, confirmed action through
 its real managed executor:
@@ -177,16 +153,14 @@ Send the `/followup` JSON as one standalone text message with no attachment.
 All five fields are required. The command only stores the policy; it does not run
 an action immediately, and a due repeat executes only after the original action
 is confirmed. Each due repeat gets a new action identity, re-checks the original
-revision, authorization, deadline, and attempt cap, and stops on a changed
-policy, rejection, or ambiguous outcome. A sensitive derived action that lacks
-current authority waits for its own exact `/approve`; approval of the original
-is not silently reused. Set `enabled` to `false` to disable the
-policy. After a restart, pre-effect local-file/install/HTTP work can resume
+revision, current policy, deadline, work state, and attempt cap, and stops on a changed
+policy, cancellation, or ambiguous outcome. No per-action confirmation is needed.
+Set `enabled` to `false` to disable the policy. After a restart, pre-effect local-file/install/HTTP work can resume
 through the real executor; work interrupted after an effect began is reconciled
 as ambiguous and is never replayed as if nothing happened. These paths are
 wired, but the broader test suite is still being repaired; this is not a claim
-of final full-product verification. Treat a verified executor result—not an
-approval command or queue admission alone—as the completion signal.
+of final full-product verification. Treat a verified executor result—not a
+command or queue admission alone—as the completion signal.
 
 ### Managed HTTP host configuration
 

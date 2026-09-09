@@ -978,7 +978,6 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonRu
         : new SdkInProcessRunner({
           root: paths.children,
           modelPattern: runtimeConfig.mainSessionModel,
-          assistantWorkRepository: store.assistantWork,
           customTools: [childLocalFileTool],
           tabs: childTabs,
           ...(options.childSessionFactory === undefined ? {} : { factory: options.childSessionFactory }),
@@ -988,7 +987,6 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonRu
         : new SdkConversationRunner({
           root: paths.children,
           modelPattern: runtimeConfig.mainSessionModel,
-          assistantWorkRepository: store.assistantWork,
           customTools: [childLocalFileTool],
           ...(options.childSessionFactory === undefined ? {} : { factory: options.childSessionFactory }),
           interimMaxBytes: runtimeConfig.children.interimMaxBytes,
@@ -1000,7 +998,6 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonRu
         : new SdkInProcessRunner({
           root: paths.children,
           modelPattern: runtimeConfig.mainSessionModel,
-          assistantWorkRepository: store.assistantWork,
           ...(options.childSessionFactory === undefined ? {} : { factory: options.childSessionFactory }),
           customTools: childObservationTools,
         }));
@@ -1122,7 +1119,6 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonRu
           ownerName: runtimeConfig.ownerName,
           chromeProfile: paths.chromeProfile,
           modelPattern: runtimeConfig.mainSessionModel,
-          assistantWorkRepository: store.assistantWork,
           delegateBackground: (request) => lifecycle!.delegate(request),
           sendImage,
           customTools,

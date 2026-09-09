@@ -8,6 +8,7 @@ import {
   openChatDbReadonly,
   probeConfig,
   probeCredentials,
+  probeFullDiskAccess,
 } from "../src/bootstrap/probes.ts";
 import type { AccountRow } from "../src/settings/service.ts";
 
@@ -128,6 +129,61 @@ describe("openChatDbReadonly", () => {
 
     expect(() => openChatDbReadonly(path)).not.toThrow();
   });
+});
+
+describe("probeFullDiskAccess", () => {
+  test("a nonexistent Messages database is missing, not proof of access or denial", async () => {
+    const home = createRoot("openinstinct-fda-missing-");
+    const result = await probeFullDiskAccess(home);
+    expect(result.status).toBe("missing");
+    expect(result.reason).toContain("unverified");
+    expect(result.reason).toContain("ENOENT");
+    expect(result.reason).not.toContain("System Settings");
+  });
+
+  for (const fixture of ["malformed", "wrong-schema", "readable"] as const) {
+    test(`classifies a real ${fixture} database`, async () => {
+      const home = createRoot("openinstinct-fda-fixture-");
+      const messages = join(home, "Library", "Messages");
+      mkdirSync(messages, { recursive: true });
+      const path = join(messages, "chat.db");
+      if (fixture === "malformed") {
+        writeFileSync(path, "not a SQLite database");
+      } else {
+        const db = new Database(path);
+        try {
+          db.exec(fixture === "readable"
+            ? "CREATE TABLE message (text TEXT); INSERT INTO message VALUES ('hello');"
+            : "CREATE TABLE unrelated (value TEXT);");
+        } finally {
+          db.close();
+        }
+      }
+      const result = await probeFullDiskAccess(home);
+      if (fixture === "readable") {
+        expect(result).toEqual({ status: "passed" });
+      } else {
+        expect(result.status).toBe("error");
+        expect(result.reason).toContain(fixture === "malformed" ? "not a database" : "no such table");
+        expect(result.reason).not.toContain("System Settings");
+      }
+    });
+  }
+
+  for (const code of ["EACCES", "EPERM", "EIO"] as const) {
+    test(`preserves native ${code} evidence without changing OS permissions`, async () => {
+      const home = createRoot("openinstinct-fda-native-");
+      const result = await probeFullDiskAccess(home, async (path, flags) => {
+        expect(path).toBe(join(home, "Library", "Messages", "chat.db"));
+        expect(flags).toBe("r");
+        throw Object.assign(new Error("native read failed"), { code });
+      });
+      expect(result.status).toBe(code === "EIO" ? "error" : "denied");
+      expect(result.reason).toContain(`${code}: native read failed`);
+      if (code === "EIO") expect(result.reason).not.toContain("System Settings");
+      else expect(result.reason).toContain("System Settings");
+    });
+  }
 });
 
 describe("probeConfig", () => {

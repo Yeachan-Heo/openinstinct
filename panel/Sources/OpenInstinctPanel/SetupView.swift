@@ -121,10 +121,10 @@ struct SetupView: View {
     private func fdaStep(probe: ProbeInfo?) -> some View {
         SetupStepRow(
             state: state(for: probe),
-            title: "Full Disk Access",
-            detail: probeDetail(probe: probe, passed: "Full Disk Access is on.")
+            title: "Full Disk Access — required baseline",
+            detail: "A one-time macOS switch, not a per-action prompt. " + probeDetail(probe: probe, passed: "Verified by the access probe.")
         ) {
-            if let probe, probe.status != "passed" {
+            if probe?.status != "passed" {
                 VStack(alignment: .leading, spacing: 4) {
                     Button("Open Full Disk Access") {
                         let path = NSHomeDirectory() + "/.openinstinct/bin/openinstinctd"
@@ -135,7 +135,7 @@ struct SetupView: View {
                         }
                     }
                     .controlSize(.small)
-                    Text("Press +, then ⌘⇧G, paste, Enter, and switch on openinstinctd. The path is already copied.")
+                    Text("Press +, then ⌘⇧G, paste, Enter, and switch on openinstinctd. The path is already copied. Gajae cannot grant this permission itself; Chat keeps running with limited OS access until the probe verifies it.")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)

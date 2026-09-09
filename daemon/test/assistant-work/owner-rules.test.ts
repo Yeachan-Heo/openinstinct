@@ -14,18 +14,16 @@ import {
 } from "../../src/owner-turn.ts";
 import {
   applyOwnerFollowupCommand,
-  applyOwnerSendRuleCommand,
   parseOwnerFollowupCommand,
-  parseOwnerSendRuleCommand,
 } from "../../src/assistant-work/owner-policy.ts";
 import { createAssistantWorkTools } from "../../src/assistant-work/tools.ts";
 import { stableAttemptId } from "../../src/assistant-work/model.ts";
 import type { EvidenceProvenance } from "../../src/assistant-work/model.ts";
 import { openStateStore, type StateStore } from "../../src/store/index.ts";
+import type { MainSession, MainTurnInput } from "../../src/sdk-session/main-session.ts";
 
 const roots: string[] = [];
 const T0 = "2026-09-06T00:00:00.000Z";
-const T1 = "2026-09-06T00:01:00.000Z";
 
 class FakeLogger {
   public readonly calls: Array<readonly [string, string, string, Record<string, unknown> | undefined]> = [];
@@ -40,6 +38,7 @@ function harness(): {
   readonly ingress: OwnerTurnIngress;
   readonly events: Array<{ readonly topic: string; readonly payload: Record<string, unknown> }>;
   readonly logger: FakeLogger;
+  readonly laneTurns: readonly MainTurnInput[];
 } {
   const root = mkdtempSync(join(tmpdir(), "openinstinct-owner-rules-"));
   roots.push(root);
@@ -48,15 +47,26 @@ function harness(): {
   const hub = new ChatHub(logger as unknown as NdjsonLogger);
   const events: Array<{ readonly topic: string; readonly payload: Record<string, unknown> }> = [];
   hub.subscribe((topic, payload) => events.push({ topic, payload }));
+  const laneTurns: MainTurnInput[] = [];
+  const lane = {
+    session: {
+      running: false,
+      turn: (input: MainTurnInput) => {
+        laneTurns.push(input);
+        return Promise.resolve({ kind: "reply", text: "ordinary owner text received" } as const);
+      },
+      steer: () => Promise.resolve({ kind: "not_admitted", reason: "idle" } as const),
+    } as unknown as MainSession,
+  };
   const ingress = new OwnerTurnIngress({
     store,
     logger: logger as unknown as NdjsonLogger,
     hub,
     outbox: new OwnerOutbox({ logger: logger as unknown as NdjsonLogger }),
-    lanes: () => undefined,
+    lanes: () => lane,
     transcript: () => [],
   });
-  return { store, ingress, events, logger };
+  return { store, ingress, events, logger, laneTurns };
 }
 
 function request(
@@ -102,23 +112,6 @@ function admitWork(store: StateStore, suffix: string): string {
   }, T0).work.id;
 }
 
-function messageAction(
-  store: StateStore,
-  workId: string,
-  semanticKey: string,
-  overrides: Partial<{ readonly recipient: string; readonly topic: string; readonly action: string }> = {},
-) {
-  return store.assistantWork.proposeAction({
-    workId,
-    semanticKey,
-    effectClass: "external_message",
-    recipient: overrides.recipient ?? "person@example.test",
-    topic: overrides.topic ?? "renewal-42",
-    action: overrides.action ?? "send_follow_up",
-    payload: { body: "Checking in" },
-  }, T0);
-}
-
 function confirmedAction(store: StateStore, workId: string, semanticKey: string) {
   const action = store.assistantWork.proposeAction({
     workId,
@@ -149,164 +142,24 @@ afterEach(() => {
 });
 
 describe("authenticated owner policy commands", () => {
-  test("creates the same exact autosend rule from panel and iMessage without invoking an LLM", async () => {
+  test("obsolete approval and send-rule commands route as ordinary owner text", async () => {
     const h = harness();
     try {
-      const command = '/allow-send {"recipient":"person@example.test","topic":"renewal-42","action":"send_follow_up"}';
-      expect(await h.ingress.admit(request("panel", "panel-rule", command))).toBe("command");
-      const rule = h.store.assistantWork.listOwnerRules()[0]!;
-      expect(rule).toMatchObject({
-        state: "enabled",
-        revision: 1,
-        matcher: {
-          effectClass: "external_message",
-          recipient: "person@example.test",
-          topic: "renewal-42",
-          action: "send_follow_up",
-        },
-        provenance: {
-          principal: "owner",
-          channel: "owner_panel",
-          subject: "authenticated-local-owner",
-          evidenceId: "owner-command:panel:panel-rule",
-        },
-      });
-      expect(lastAssistantText(h.events)).toContain(`Rule ${rule.id} is enabled at revision 1`);
-      expect(lastAssistantText(h.events)).toContain(`/revoke-send ${rule.id} ${rule.revision}`);
-
-      expect(await h.ingress.admit(request("imessage", "imessage-rule", command))).toBe("command");
-      expect(lastAssistantText(h.events)).toContain("was already enabled");
-      expect(h.store.assistantWork.listOwnerRules()).toEqual([rule]);
-      expect(h.logger.calls.some((call) => (
-        call[1] === "assistant_work"
-        && call[2] === "owner_action_command"
-        && call[3]?.source === "imessage"
-        && call[3]?.operation === "allow_send"
-        && call[3]?.ruleId === rule.id
-        && call[3]?.applied === true
-      ))).toBe(true);
-      expect(h.logger.calls.some((call) => (
-        call[1] === "assistant_work"
-        && call[2] === "owner_action_command"
-        && call[3]?.operation === "allow_send"
-        && call[3]?.applied === true
-      ))).toBe(true);
-      const imessageCommand = '/allow-send {"recipient":"sms@example.test","topic":"incident-7","action":"send_update"}';
-      expect(await h.ingress.admit(request("imessage", "imessage-new-rule", imessageCommand))).toBe("command");
-      expect(h.store.assistantWork.listOwnerRules("enabled")).toContainEqual(expect.objectContaining({
-        matcher: expect.objectContaining({ recipient: "sms@example.test", topic: "incident-7", action: "send_update" }),
-        provenance: expect.objectContaining({
-          principal: "owner",
-          channel: "owner_imessage",
-          subject: "authenticated-owner",
-          evidenceId: "owner-command:imessage:imessage-new-rule",
-        }),
-      }));
-      expect(h.store.assistantWork.listExplicitApprovals()).toHaveLength(0);
-    } finally {
-      h.store.close();
-    }
-  });
-
-  test("rejects bad JSON, extra keys, empty values, wildcards, mixed text, and attachments", async () => {
-    const h = harness();
-    try {
-      const invalid = [
-        "/allow-send not-json",
-        '/allow-sender {"recipient":"person@example.test","topic":"renewal-42","action":"send_follow_up"}',
-        '/allow-send {"recipient":"person@example.test","topic":"renewal-42","action":"send_follow_up","account":"hidden"}',
-        '/allow-send {"recipient":"","topic":"renewal-42","action":"send_follow_up"}',
-        '/allow-send {"recipient":"person@example.test\\nother","topic":"renewal-42","action":"send_follow_up"}',
-        '/allow-send {"recipient":"*@example.test","topic":"renewal-42","action":"send_follow_up"}',
-        '/allow-send {"recipient":"person@example.test","topic":"*","action":"send_follow_up"}',
-        '/allow-send {"recipient":"person@example.test","topic":"renewal-42","action":"send_*"}',
-        `/allow-send ${JSON.stringify({ recipient: "r".repeat(4_097), topic: "renewal-42", action: "send_follow_up" })}`,
-        '/allow-send {"recipient":"person@example.test","recipient":"other@example.test","topic":"renewal-42","action":"send_follow_up"}',
-      ];
-      for (const [index, text] of invalid.entries()) {
-        expect(await h.ingress.admit(request("panel", `bad-${index}`, text))).toBe("command");
+      for (const source of ["panel", "imessage"] as const) {
+        for (const [index, text] of [
+          "/approve action 1 digest",
+          '/allow-send {"recipient":"person@example.test","topic":"renewal-42","action":"send_follow_up"}',
+          "/allow-send not-json",
+          "/revoke-send rule 1",
+          "please /approve action 1 digest",
+        ].entries()) {
+          const turn = request(source, `${source}-obsolete-${index}`, text);
+          expect(await h.ingress.admit(turn)).toBe("started");
+          expect(h.laneTurns.at(-1)).toMatchObject({ owner: true, turnId: turn.turnId, text: turn.promptText });
+        }
       }
-      expect(h.store.assistantWork.listOwnerRules()).toHaveLength(0);
-
-      const exact = '/allow-send {"recipient":"person@example.test","topic":"renewal-42","action":"send_follow_up"}';
-      expect(parseOwnerSendRuleCommand(`please ${exact}`)).toMatchObject({ kind: "invalid" });
-      expect(parseOwnerSendRuleCommand(`quote: \"${exact}\"`)).toMatchObject({ kind: "invalid" });
-      expect(parseOwnerSendRuleCommand(`Please ${exact.replace("/allow-send", "/ALLOW-SEND")}`)).toMatchObject({ kind: "invalid" });
-      expect(await h.ingress.admit(request("panel", "mixed", `please ${exact}`))).toBe("command");
-      expect(lastAssistantText(h.events)).toContain("standalone text");
-      expect(await h.ingress.admit(request("imessage", "attachment", exact, { attachment: true }))).toBe("command");
-      expect(lastAssistantText(h.events)).toContain("standalone text");
-      expect(h.store.assistantWork.listOwnerRules()).toHaveLength(0);
-      expect(await h.ingress.admit(request("panel", "bad-revoke", "/revoke-send rule 0"))).toBe("command");
-      expect(await h.ingress.admit(request("panel", "wildcard-revoke", "/revoke-send * 1"))).toBe("command");
-      expect(h.store.assistantWork.listOwnerRules()).toHaveLength(0);
-    } finally {
-      h.store.close();
-    }
-  });
-
-  test("revokes by exact rule revision and prevents a later external-message claim", async () => {
-    const h = harness();
-    try {
-      const allow = '/allow-send {"recipient":"person@example.test","topic":"renewal-42","action":"send_follow_up"}';
-      await h.ingress.admit(request("panel", "allow", allow));
-      const rule = h.store.assistantWork.listOwnerRules("enabled")[0]!;
-      const workId = admitWork(h.store, "revoke");
-      const before = messageAction(h.store, workId, "before-revoke");
-      expect(h.store.assistantWork.claimForDispatch({
-        actionId: before.id,
-        revision: before.revision,
-        digest: before.digest,
-        attemptId: stableAttemptId(before.id, before.revision, "before-revoke"),
-        workerId: "owner-rule-test",
-      }, T1)).toMatchObject({ kind: "claimed", attempt: { authorizationSource: "owner_rule", authorizationId: rule.id } });
-      const mismatches = [
-        messageAction(h.store, workId, "wrong-recipient", { recipient: "other@example.test" }),
-        messageAction(h.store, workId, "wrong-topic", { topic: "other-topic" }),
-        messageAction(h.store, workId, "wrong-action", { action: "send_invoice" }),
-      ];
-      for (const [index, mismatch] of mismatches.entries()) {
-        expect(h.store.assistantWork.claimForDispatch({
-          actionId: mismatch.id,
-          revision: mismatch.revision,
-          digest: mismatch.digest,
-          attemptId: stableAttemptId(mismatch.id, mismatch.revision, `mismatch-${index}`),
-          workerId: "owner-rule-test",
-        }, T1)).toMatchObject({ kind: "rejected", reason: "approval_required" });
-      }
-
-      const revoke = `/revoke-send ${rule.id} ${rule.revision}`;
-      expect(await h.ingress.admit(request("imessage", "revoke", revoke))).toBe("command");
-      expect(h.store.assistantWork.getOwnerRule(rule.id)).toMatchObject({
-        state: "revoked",
-        revision: rule.revision + 1,
-        provenance: {
-          principal: "owner",
-          channel: "owner_panel",
-          evidenceId: "owner-command:panel:allow",
-        },
-      });
-      expect(h.logger.calls.some((call) => (
-        call[1] === "assistant_work"
-        && call[2] === "owner_action_command"
-        && call[3]?.source === "imessage"
-        && call[3]?.operation === "revoke_send"
-        && call[3]?.ruleId === rule.id
-        && call[3]?.applied === true
-      ))).toBe(true);
-      expect(lastAssistantText(h.events)).toContain("future claims cannot use it");
-      expect(await h.ingress.admit(request("panel", "stale-revoke", revoke))).toBe("command");
-      expect(lastAssistantText(h.events)).toContain("stale owner rule revision");
-      expect(h.store.assistantWork.getOwnerRule(rule.id)).toMatchObject({ state: "revoked", revision: rule.revision + 1 });
-
-      const after = messageAction(h.store, workId, "after-revoke");
-      expect(h.store.assistantWork.claimForDispatch({
-        actionId: after.id,
-        revision: after.revision,
-        digest: after.digest,
-        attemptId: stableAttemptId(after.id, after.revision, "after-revoke"),
-        workerId: "owner-rule-test",
-      }, T1)).toMatchObject({ kind: "rejected", reason: "approval_required" });
+      expect(h.logger.calls.some((call) => call[2] === "owner_action_command")).toBe(false);
+      expect(h.store.assistantWork.listFollowupPolicies()).toHaveLength(0);
     } finally {
       h.store.close();
     }
@@ -443,7 +296,6 @@ describe("authenticated owner policy commands", () => {
 
   test("third-party/model evidence cannot call host owner-policy persistence paths", async () => {
     const h = harness();
-    const parsed = parseOwnerSendRuleCommand('/allow-send {"recipient":"person@example.test","topic":"renewal-42","action":"send_follow_up"}');
     const followupWorkId = admitWork(h.store, "quoted-followup");
     const followupAction = confirmedAction(h.store, followupWorkId, "quoted-followup");
     const parsedFollowup = parseOwnerFollowupCommand(`/followup ${JSON.stringify({
@@ -460,13 +312,6 @@ describe("authenticated owner policy commands", () => {
       evidenceId: "quoted-owner-rule",
     };
     try {
-      if (parsed?.kind !== "valid") throw new Error("fixture command did not parse");
-      expect(() => applyOwnerSendRuleCommand({
-        repository: h.store.assistantWork,
-        command: parsed.command,
-        provenance: thirdParty,
-        now: T0,
-      })).toThrow("authenticated owner provenance");
       if (parsedFollowup?.kind !== "valid") throw new Error("fixture follow-up command did not parse");
       expect(() => applyOwnerFollowupCommand({
         repository: h.store.assistantWork,
@@ -507,7 +352,6 @@ describe("authenticated owner policy commands", () => {
         unfinishedEvidence: ["The model quoted a follow-up command."],
       });
       expect(h.store.assistantWork.listFollowupPolicies()).toHaveLength(0);
-      expect(h.store.assistantWork.listOwnerRules()).toHaveLength(0);
     } finally {
       h.store.close();
     }

@@ -61,7 +61,7 @@ export interface ManagedInstallPreflightInput {
   readonly destination: string;
   /** Host-owned injection for tests. Production callers omit this. */
   readonly bunPath?: string;
-  /** Defaults true. False requires explicit owner approval because scripts are not contained. */
+  /** Defaults false so installs use the package manager's normal lifecycle behavior. */
   readonly ignoreScripts?: boolean;
   /** Host-owned ledger used to recognize a previously confirmed managed root. */
   readonly repository?: AssistantWorkRepository;
@@ -245,14 +245,9 @@ interface ManagedInstallToolParams {
 }
 
 /**
- * Registration API for the main session. The model can select package and
- * destination, but cannot select an executable, argv, effect class, approval,
- * credentials, environment, or shell command.
- *
- * Bun's --ignore-scripts control is cooperative package-manager policy, not a
- * sandbox. Allowing lifecycle scripts therefore becomes external_mutation and
- * requires owner approval because scripts may touch paths outside the selected
- * directory; even ignored scripts are not claimed as hard OS containment.
+ * Optional durable install tool for one exact package version and destination.
+ * The host constructs argv and verifies the installed package metadata.
+ * Lifecycle scripts use normal package-manager behavior unless explicitly disabled.
  */
 export function createManagedInstallTool(options: ManagedInstallToolOptions): CustomTool {
   const now = options.now ?? (() => new Date());
@@ -266,7 +261,7 @@ export function createManagedInstallTool(options: ManagedInstallToolOptions): Cu
     label: "Managed Bun Package Install",
     strict: true,
     concurrency: "exclusive",
-    description: "Propose or execute one exact-version Bun package install in an absolute user-selected work directory. Host preflight computes authority; model labels and credentials never authorize it. Lifecycle scripts are cooperative code, not sandboxed.",
+    description: "Propose or execute one exact-version Bun package install in an absolute work directory. Preflight records the destination and constructs argv. Execute the planned action immediately using its exact identity; package metadata is verified after execution.",
     parameters: Type.Object({
       operation: Type.Enum(["propose", "execute"]),
       workId: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
@@ -324,7 +319,7 @@ export function createManagedInstallTool(options: ManagedInstallToolOptions): Cu
         maxOutputBytes,
       });
       return {
-        content: [{ type: "text" as const, text: executionText(result, actionId, revision, digest) }],
+        content: [{ type: "text" as const, text: executionText(result, actionId, revision) }],
         details: executionDetails(result, attemptId),
       };
     },
@@ -343,8 +338,8 @@ export async function preflightManagedInstall(
   if (input.ignoreScripts !== undefined && typeof input.ignoreScripts !== "boolean") {
     throw new ManagedInstallError("invalid_plan", "ignoreScripts must be a boolean");
   }
-  const options: ManagedInstallOptions = { exact: true, ignoreScripts: input.ignoreScripts ?? true };
-  const inventory = authorizeDedicatedRoot(await inspectInstallDestination(destination, packageSpec), input.repository);
+  const options: ManagedInstallOptions = { exact: true, ignoreScripts: input.ignoreScripts ?? false };
+  const inventory = recognizeDedicatedRoot(await inspectInstallDestination(destination, packageSpec), input.repository);
   const effectClass = classifyManagedInstall(inventory, options);
   const plan: ManagedInstallPlan = {
     version: 1,
@@ -384,7 +379,7 @@ export async function inspectManagedInstallPlan(
   plan: ManagedInstallPlan,
   repository?: AssistantWorkRepository,
 ): Promise<ManagedInstallInspection> {
-  const inventory = authorizeDedicatedRoot(
+  const inventory = recognizeDedicatedRoot(
     await inspectInstallDestination(plan.destination, plan.packageSpec),
     repository,
   );
@@ -668,13 +663,13 @@ export function installArgv(plan: ManagedInstallPlan): readonly string[] {
 
 // A marker is only structural evidence. A non-empty root becomes ordinary only
 // after the durable ledger contains a confirmed managed install for that path;
-// package contents or model-authored labels cannot create local-policy authority.
-function authorizeDedicatedRoot(
+// package contents or model-authored labels cannot establish that history.
+function recognizeDedicatedRoot(
   inventory: ManagedInstallInventory,
   repository: AssistantWorkRepository | undefined,
 ): ManagedInstallInventory {
   if (!inventory.dedicatedToolRoot || !inventory.existing || inventory.entries.length === 0) return inventory;
-  const confirmed = repository?.listActions().some((action) => {
+  const confirmed = repository?.listActions().actions.some((action) => {
     if (action.action !== MANAGED_INSTALL_ACTION || action.state !== "confirmed") return false;
     try {
       const prior = parseManagedInstallPlan(action.payload);
@@ -698,7 +693,7 @@ function authorizeDedicatedRoot(
 
 export function classifyManagedInstall(
   inventory: ManagedInstallInventory,
-  options: ManagedInstallOptions = { exact: true, ignoreScripts: true },
+  options: ManagedInstallOptions = { exact: true, ignoreScripts: false },
 ): ManagedInstallEffectClass {
   if (isAccountRightsPath(inventory.destination) || isAccountRightsPath(inventory.resolvedDestination)) {
     return "account_rights_change";
@@ -1484,8 +1479,6 @@ function rejectionForAttempt(state: AttemptRecord["state"]): ClaimRejectionReaso
 function rejectionForTerminalAction(state: ActionRecord["state"]): ClaimRejectionReason | undefined {
   switch (state) {
     case "planned":
-    case "approval_pending":
-    case "authorized":
     case "claimed_pre_effect":
       return undefined;
     case "blocked":
@@ -1507,22 +1500,18 @@ function rejectionForTerminalAction(state: ActionRecord["state"]): ClaimRejectio
 
 function proposalText(action: ActionRecord): string {
   const identity = `action ${action.id} revision ${action.revision} digest ${action.digest}`;
-  if (action.state === "approval_pending") {
-    return `Approval required for ${identity}. No install has run. Send exactly: /approve ${action.id} ${action.revision} ${action.digest}`;
-  }
-  if (action.state === "authorized") {
-    return `Prepared ${identity} under local policy. No install has run. Execute assistant_managed_install with operation=execute and this exact actionId, revision, and digest.`;
+  if (action.state === "planned") {
+    return `Prepared ${identity}. No install has run. Execute assistant_managed_install with operation=execute and this exact actionId, revision, and digest.`;
   }
   return `Recorded ${identity} in state ${action.state}. No install has run.`;
 }
 
-function executionText(result: ManagedInstallExecutionResult, actionId: string, revision: number, digest: string): string {
+function executionText(result: ManagedInstallExecutionResult, actionId: string, revision: number): string {
   if (result.kind === "confirmed") return `Confirmed action ${actionId} revision ${revision}. Bun exited successfully and package metadata verified the install.`;
   if (result.kind === "ambiguous") return `Action ${actionId} revision ${revision} is ambiguous after effect_started. Do not retry it; reconcile the recorded inventory.`;
   if (result.kind === "definitive_failed") return `Action ${actionId} revision ${revision} failed definitively. No blind retry was attempted.`;
   if (result.kind === "preflight_rejected") return `Did not dispatch action ${actionId} revision ${revision}: ${result.message}. Re-propose from current host evidence.`;
   if (result.kind === "rejected") {
-    if (result.reason === "approval_required") return `Approval required for action ${actionId} revision ${revision} digest ${digest}. No install has run. Send exactly: /approve ${actionId} ${revision} ${digest}`;
     return `Did not dispatch action ${actionId} revision ${revision}: ${result.reason}. No new install was invoked.`;
   }
   throw new Error(`Unexpected install result: ${result.kind}`);
@@ -1582,7 +1571,6 @@ function attemptSummary(attempt: AttemptRecord): Record<string, unknown> {
     actionRevision: attempt.actionRevision,
     actionDigest: attempt.actionDigest,
     state: attempt.state,
-    authorizationSource: attempt.authorizationSource,
     claimedAt: attempt.claimedAt,
     ...(attempt.effectStartedAt === undefined ? {} : { effectStartedAt: attempt.effectStartedAt }),
     ...(attempt.settledAt === undefined ? {} : { settledAt: attempt.settledAt }),

@@ -945,14 +945,15 @@ describe("status.get model surface", () => {
 });
 
 describe("WI-19 detached chat lane", () => {
-  test("boots without an owner handle and serves chat verbs without touching FakePort or TCC probes", async () => {
+  test("boots without an owner handle and serves chat while checking baseline disk access without touching FakePort", async () => {
     const harness = await boot({ configObject: {} });
     let connection: Connection | undefined;
     try {
       connection = await connectControl(harness.paths.controlSocket);
       const status = payloadOf(await request(connection, "status", "status.get", {}));
       expect(status.imessage).toMatchObject({ state: "detached", reason: "no_owner_handle" });
-      expect(harness.probes.fdaCalls).toBe(0);
+      expect(harness.probes.fdaCalls).toBeGreaterThan(0);
+      expect(status.bootstrap).toMatchObject({ probes: { fda: { status: "passed" } } });
       await request(connection, "subscribe", "chat.subscribe", {});
       const response = await request(connection, "send", "chat.send", { text: "chat only" });
       expect(response).toMatchObject({ type: "response", payload: { outcome: "started" } });

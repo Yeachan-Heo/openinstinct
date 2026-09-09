@@ -17,19 +17,12 @@ import {
   preflightLocalFileAction,
 } from "../../src/assistant-work/local-effects.ts";
 import { stableAttemptId } from "../../src/assistant-work/model.ts";
-import type { EvidenceProvenance } from "../../src/assistant-work/model.ts";
 import { openStateStore } from "../../src/store/db.ts";
 
 const directories: string[] = [];
 const T0 = "2026-01-01T00:00:00.000Z";
 const T1 = "2026-01-01T00:01:00.000Z";
 const T2 = "2026-01-01T00:02:00.000Z";
-const OWNER: EvidenceProvenance = {
-  principal: "owner",
-  channel: "chat",
-  subject: "owner-account",
-  evidenceId: "owner-local-effect-approval",
-};
 
 function fixtureRoot(): string {
   const root = mkdtempSync(join(tmpdir(), "openinstinct-local-effects-"));
@@ -83,7 +76,7 @@ describe("managed local file preflight and execution", () => {
       });
 
       const action = store.assistantWork.proposeAction(preflight.proposal, T0);
-      expect(action.state).toBe("authorized");
+      expect(action.state).toBe("planned");
       const attemptId = stableAttemptId(action.id, action.revision, "ordinary-write");
       const result = await executeManagedLocalFileAction({
         repository: store.assistantWork,
@@ -98,7 +91,7 @@ describe("managed local file preflight and execution", () => {
       expect(result).toMatchObject({
         kind: "confirmed",
         action: { state: "confirmed" },
-        attempt: { id: attemptId, state: "confirmed", authorizationSource: "local_policy", effectStartedAt: T1 },
+        attempt: { id: attemptId, state: "confirmed", effectStartedAt: T1 },
       });
       expect(readFileSync(target, "utf8")).toBe("after");
       expect(store.assistantWork.getAttempt(attemptId)).toMatchObject({
@@ -116,7 +109,7 @@ describe("managed local file preflight and execution", () => {
     }
   });
 
-  test("does not claim or delete an existing file without exact owner approval", async () => {
+  test("immediately deletes an existing file without owner approval", async () => {
     const root = fixtureRoot();
     const target = join(root, "keep.txt");
     writeFileSync(target, "keep me", "utf8");
@@ -130,7 +123,7 @@ describe("managed local file preflight and execution", () => {
       });
       expect(preflight.effectClass).toBe("delete_existing");
       const action = store.assistantWork.proposeAction(preflight.proposal, T0);
-      expect(action.state).toBe("approval_pending");
+      expect(action.state).toBe("planned");
 
       const result = await executeManagedLocalFileAction({
         repository: store.assistantWork,
@@ -142,9 +135,9 @@ describe("managed local file preflight and execution", () => {
         now: () => T1,
       });
 
-      expect(result).toMatchObject({ kind: "rejected", reason: "approval_required" });
-      expect(readFileSync(target, "utf8")).toBe("keep me");
-      expect(store.assistantWork.listAttempts(action.id)).toHaveLength(0);
+      expect(result).toMatchObject({ kind: "confirmed", attempt: { state: "confirmed" } });
+      expect(existsSync(target)).toBe(false);
+      expect(store.assistantWork.listAttempts(action.id)).toHaveLength(1);
     } finally {
       store.close();
     }
@@ -296,26 +289,20 @@ describe("managed local file preflight and execution", () => {
     }
   });
 
-  test("executes an explicitly approved delete and confirms actual absence", async () => {
+  test("executes a delete and confirms actual absence", async () => {
     const root = fixtureRoot();
-    const target = join(root, "approved-delete.txt");
+    const target = join(root, "immediate-delete.txt");
     writeFileSync(target, "remove me", "utf8");
     const store = fixtureStore(root);
     try {
-      const work = admitWork(store, "approved-delete");
+      const work = admitWork(store, "immediate-delete");
       const preflight = await preflightLocalFileAction({
         workId: work.id,
-        semanticKey: "approved-delete",
+        semanticKey: "immediate-delete",
         operations: [{ operation: "delete_file", path: target }],
       });
       const action = store.assistantWork.proposeAction(preflight.proposal, T0);
-      store.assistantWork.grantExplicitApproval({
-        actionId: action.id,
-        revision: action.revision,
-        digest: action.digest,
-        provenance: OWNER,
-      }, T1);
-      const attemptId = stableAttemptId(action.id, action.revision, "approved-delete");
+      const attemptId = stableAttemptId(action.id, action.revision, "immediate-delete");
 
       const result = await executeManagedLocalFileAction({
         repository: store.assistantWork,
@@ -329,7 +316,7 @@ describe("managed local file preflight and execution", () => {
 
       expect(result).toMatchObject({
         kind: "confirmed",
-        attempt: { authorizationSource: "owner_explicit" },
+        attempt: { state: "confirmed" },
         evidence: {
           kind: "managed_local_file_receipt",
           paths: [{ operation: "delete_file", path: target, state: "absent", existingAsset: false }],
@@ -341,7 +328,7 @@ describe("managed local file preflight and execution", () => {
     }
   });
 
-  test("requires approval for existing assets across folders but not for new files across folders", async () => {
+  test("updates existing assets across folders while classifying new files separately", async () => {
     const root = fixtureRoot();
     const firstDirectory = join(root, "first");
     const secondDirectory = join(root, "second");
@@ -364,7 +351,7 @@ describe("managed local file preflight and execution", () => {
       });
       expect(bulk.effectClass).toBe("bulk_existing_user_assets");
       const bulkAction = store.assistantWork.proposeAction(bulk.proposal, T0);
-      const rejected = await executeManagedLocalFileAction({
+      const executed = await executeManagedLocalFileAction({
         repository: store.assistantWork,
         actionId: bulkAction.id,
         revision: bulkAction.revision,
@@ -373,9 +360,9 @@ describe("managed local file preflight and execution", () => {
         workerId: "local-worker",
         now: () => T1,
       });
-      expect(rejected).toMatchObject({ kind: "rejected", reason: "approval_required" });
-      expect(readFileSync(firstExisting, "utf8")).toBe("first");
-      expect(readFileSync(secondExisting, "utf8")).toBe("second");
+      expect(executed).toMatchObject({ kind: "confirmed" });
+      expect(readFileSync(firstExisting, "utf8")).toBe("changed first");
+      expect(readFileSync(secondExisting, "utf8")).toBe("changed second");
 
       const newFiles = await preflightLocalFileAction({
         workId: work.id,
@@ -397,7 +384,7 @@ describe("managed local file preflight and execution", () => {
     }
   });
 
-  test("classifies core system file paths as owner-approved effects without touching them", () => {
+  test("classifies core system file paths without touching them", () => {
     const path = "/System/Library/OpenInstinct/fixture.conf";
     const parentPath = "/System/Library/OpenInstinct";
     const precondition = {

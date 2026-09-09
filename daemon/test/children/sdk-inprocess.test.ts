@@ -5,6 +5,8 @@ import { join } from "node:path";
 
 import {
   SdkInProcessRunner,
+  childSystemPrompt,
+  composeChildSessionExtensions,
   type ChildAgentSession,
   type ChildSessionFactory,
 } from "../../src/children/runners/sdk-inprocess.ts";
@@ -14,6 +16,51 @@ const directories: string[] = [];
 afterEach(() => {
   for (const directory of directories.splice(0)) {
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("child application extensions allow raw tools and preserve tab ownership", async () => {
+  const handlers: Array<(event: unknown) => unknown> = [];
+  const ensured: string[] = [];
+  const tabs = {
+    ensure: async (prefix: string) => { ensured.push(prefix); return undefined; },
+    release: async () => true,
+    sweep: async () => [],
+  };
+  for (const extension of composeChildSessionExtensions("/tmp/child-profile", "child-", tabs)) {
+    await extension({
+      on: (name: string, handler: (event: unknown) => unknown) => {
+        if (name === "tool_call") handlers.push(handler);
+      },
+    } as never);
+  }
+  expect(handlers).toHaveLength(1);
+  for (const toolName of ["write", "edit", "bash", "browser", "unknown_plugin_tool"]) {
+    const input = toolName === "browser"
+      ? { action: "click", name: "child-main", app: { browser: "chrome", user_data_dir: "/tmp/child-profile", cdp_port: 9222, target: "child-" } }
+      : { path: "/tmp/child-file", command: "touch /tmp/child-file" };
+    for (const handler of handlers) {
+      expect(await handler({ type: "tool_call", toolCallId: toolName, toolName, input })).toBeUndefined();
+    }
+  }
+  expect(ensured).toEqual(["child-"]);
+  expect(await handlers[0]!({ type: "tool_call", toolName: "browser", input: {
+    name: "other-main", app: { browser: "chrome", user_data_dir: "/tmp/child-profile", cdp_port: 9222, target: "child-" },
+  } })).toMatchObject({ block: true });
+  expect(ensured).toEqual(["child-"]);
+});
+
+test("observers retain task intent without mandatory managed tools or approval instructions", () => {
+  for (const conversational of [false, true]) {
+    for (const observations of [false, true]) {
+      const prompt = childSystemPrompt(["SDK defaults"], conversational, "child-", observations).join("\n");
+      expect(prompt).toContain("SDK runtime tools are available directly; custom managed tools are optional");
+      expect(prompt).toContain("verify effects before claiming success");
+      expect(prompt).not.toContain("/approve");
+      expect(prompt).not.toContain("instead of raw write/edit");
+      expect(prompt).not.toContain("remain ambiguous after execution");
+      if (observations) expect(prompt).toContain("assigned observation task");
+    }
   }
 });
 

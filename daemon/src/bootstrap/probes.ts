@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 
-import { readFile } from "node:fs/promises";
+import { open, readFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { normalizeHandle } from "../imessage/allowlist.ts";
@@ -171,14 +171,35 @@ export function openChatDbReadonly(path: string): void {
   }
 }
 
-export async function probeFullDiskAccess(home: string): Promise<ProbeResult> {
+export async function probeFullDiskAccess(
+  home: string,
+  openReadonly: (path: string, flags: "r") => Promise<{ close(): Promise<void> }> = open,
+): Promise<ProbeResult> {
+  const path = join(home, "Library", "Messages", "chat.db");
   try {
-    openChatDbReadonly(join(home, "Library", "Messages", "chat.db"));
+    // Native open preserves errno; SQLite can collapse missing and denied into CANTOPEN.
+    const file = await openReadonly(path, "r");
+    await file.close();
+    openChatDbReadonly(path);
     return { status: "passed" };
-  } catch {
+  } catch (error) {
+    const code = isRecord(error) && typeof error.code === "string" ? error.code : undefined;
+    const detail = `${code === undefined ? "" : `${code}: `}${error instanceof Error ? error.message : String(error)}`;
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      return {
+        status: "missing",
+        reason: `Full Disk Access is unverified: the Messages database is unavailable. ${detail}`,
+      };
+    }
+    if (code === "EACCES" || code === "EPERM") {
+      return {
+        status: "denied",
+        reason: `OS access to chat.db was denied; check file permissions and the installed daemon's Full Disk Access in System Settings. ${detail}`,
+      };
+    }
     return {
-      status: "denied",
-      reason: "chat.db cannot be opened read-only; grant Full Disk Access to the installed daemon",
+      status: "error",
+      reason: `Full Disk Access check could not verify chat.db readability and schema. ${detail}`,
     };
   }
 }

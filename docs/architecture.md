@@ -33,10 +33,12 @@ must win. Then `startDaemon()`:
 1. **Bootstrap machine** probes `config` and AI credentials. Credentials are the
    only core-lane gate. A missing or malformed `config.json` does not block
    startup: `core-config.ts` applies per-scope product defaults and logs the
-   fallback. When an owner handle is configured, it also probes Full Disk Access
-   (`chat.db`) and Automation (an `osascript` query to Messages); those probes
-   are skipped for a chat-only install. It re-probes every 5 s and publishes
-   status on the socket.
+   fallback. Full Disk Access (`chat.db`) is a required baseline probed even for
+   Chat-only use. A failed, denied, or unknown FDA probe reports limited OS capabilities
+   without stopping the core. FDA is a one-time macOS TCC switch: the owner enables
+   it in System Settings, and only a real successful probe establishes access.
+   The runtime cannot self-grant it. Optional Messages permission probes run for a
+   configured owner handle. It re-probes every 5 s and publishes status on the socket.
 2. **Store** opens `state.db` (migrations in `store/migrations.ts`).
 3. **Control server** listens on the socket immediately, including while the
    core is waiting for credentials, so the panel can show why.
@@ -147,16 +149,26 @@ It is never respawned per message.
   `assistant_local_file`, `assistant_work_status`, `assistant_managed_install`,
   and `assistant_managed_http`. Task/conversational children receive the managed
   local-file tool; monitor children receive observation and read-only
-  service-monitor tools. The managed raw-effect gate wraps the actual main and
-  child SDK extension lifecycles.
-- **Extensions**: `browser/enforce.ts` blocks any `browser` tool call not
-  pinned to the dedicated Chrome profile and returns the exact `app` block to
-  retry with.
+  service-monitor tools. Raw tool calls execute directly without an application
+  approval interceptor.
+- **Extensions**: `browser/enforce.ts` preserves the dedicated Chrome profile and
+  child-tab routing for account identity and concurrent-tab collision prevention.
+  Other SDK hard-enforcer restrictions are removed: native permission defaults are
+  allow, with no application path denylist, blanket Discord API prohibition,
+  main-shell timeout restriction, fixed tool-call budget, or task/subagent/job ban.
+  OS and service permissions still apply; task-relevant access does not justify
+  exposing secrets.
+- **Responsive delegation**: MainSession recommends `delegate_background` for long
+  work because it integrates child lifecycle, progress, and receipt reporting.
+  It is not the only available spawner. Native task/subagent/job tools remain usable,
+  and suitable timeouts or asynchronous shell execution are task-level choices.
+  MainSession continues to review and relay child reports rather than letting
+  background workers send iMessage directly.
 
 ## Assistant work and managed effects
 
 `assistant-work/` and `store/assistant-work.ts` implement a durable ledger for
-work items, observations, canonical action revisions, approvals, attempts, and
+work items, observations, canonical action revisions, attempts, and
 owner notifications. `assistant_work_observe` accepts only `system` or
 `third_party` provenance. A host-side assessment decides whether evidence is
 irrelevant, an uncertain proposal, or clear unfinished work worth tracking;
@@ -165,75 +177,48 @@ can turn the clear case into a service-neutral read-only monitor at a 5-minute
 cadence for important/ongoing work or 45 minutes otherwise. Its read-only rule
 is cooperative policy, not OS-level confinement.
 
-The registered managed paths are:
+The optional durable managed paths are:
 
 - `assistant_local_file` proposes or executes regular-file writes and explicit
   deletes at normalized absolute paths. Host preflight inventories the targets
   and derives the effect class; the model cannot label its own action safe.
 - `assistant_managed_install` proposes or executes one exact-version Bun
   package in an absolute work directory. The host owns the Bun path and argv,
-  defaults to lifecycle scripts disabled, and inventories the destination
+  defaults to `ignoreScripts=false` with normal package lifecycle behavior, and inventories the destination
   before and after the one spawn.
 - `assistant_managed_http` performs a bounded GET or proposes/executes one exact
   POST, PUT, PATCH, or DELETE request. Mutations run once without redirects or
   automatic retry, then a separate GET verifies the expected remote state.
 - `assistant_work_status` reads work, action, revision/digest, and attempt state;
-  it cannot approve or dispatch anything.
+  it cannot dispatch anything.
 
-The SDK-level managed tool gate also intercepts raw `bash`, mutating browser
-calls, and unknown tool effects in both main and child sessions. Raw file
-writes/edits are redirected to `assistant_local_file`. Where managed execution
-is available, other raw effects are bound to the exact tool name and canonical
-input digest, require exact owner approval, persist `effect_started` before the
-SDK invokes them once, and settle as `ambiguous` because a tool result is
-execution evidence, not independent verification. Observation-only monitor
-children fail closed instead. This is a cooperative gate over actual SDK calls,
-not an OS sandbox or fake-success wrapper.
+Main and background sessions execute owner tasks directly with available raw shell,
+file, browser, and other tools, without per-action confirmation or forced managed
+redirection. Managed tools are optional durable preflight and verified-effect paths.
+A tool result remains execution evidence, not independent verification; uncertain
+effects must not be reported as verified, and retries must account for duplicate effects.
 
-Every proposal is identified by an action ID, positive revision, and canonical
+Every new managed action starts as `planned` and is identified by an action ID, positive revision, and canonical
 SHA-256 digest. Execution must present that exact triple. The executor
 re-inspects host state before claim and again before mutation, persists
 `effect_started` before invoking the effect, and settles with verified evidence.
 An ambiguous post-effect result is reconcile-only: it is not blindly retried.
-Ordinary local edits and a recognized dedicated managed install root can use
-local policy. Deletes, existing-user-asset changes, core/account changes,
-lifecycle scripts, managed HTTP mutations, and opaque raw effects require exact
-owner authority or remain blocked. A managed HTTP action marked as an external
-message may instead use a currently enabled owner rule whose recipient, topic,
-and action all match exactly.
+These identity and state checks preserve data integrity and cancellation, not an
+application permission exchange. The runtime does not grant OS permissions.
 
-Owner authority is minted only in `OwnerTurnIngress`, after the local Chat socket
-or configured iMessage allowlist authenticates the direct owner message. Action
-approval/rejection commands are exact, standalone, text-only lines:
+`OwnerTurnIngress` authenticates direct owner messages through the local Chat socket
+or configured iMessage allowlist. Exact cancellation uses a standalone, text-only line:
 
 ```text
-/approve ACTION_ID REVISION DIGEST
 /reject ACTION_ID REVISION DIGEST
 ```
 
 The digest is 64 lowercase hexadecimal characters. Attachments, extra words,
-unknown actions, and stale revisions/digests are rejected. `supportsManagedApproval`
-recognizes the managed local-file action and validates the persisted payload for
-managed-install, managed-HTTP, and managed opaque-tool records. Ordinary
-conversation and content copied from a
-website, message, monitor, child, memory, or tool are never approval. `/reject`
-cancels the matching current revision without running it. `/approve` records
-one exact approval and hands the direct owner command to MainSession; the model
-must call the matching managed executor with that same ID/revision/digest, or
-retry the exact unchanged raw tool input once. Completion still comes only from
-the durable executor result.
-
-External-message rules use separate exact, standalone, text-only commands:
-
-```text
-/allow-send {"recipient":"…","topic":"…","action":"…"}
-/revoke-send RULE_ID REVISION
-```
-
-The JSON accepts exactly those three non-wildcard fields. A rule authorizes only
-that recipient/topic/action tuple, never another account or effect; revocation
-is revision-fenced and prevents future claims. Non-message HTTP mutations and
-all opaque raw effects still require action-specific `/approve`.
+unknown actions, and stale revisions/digests are rejected. `/reject` cancels the
+matching current revision without starting a new effect; it cannot undo an effect
+already started. Websites, messages, monitors, child reports, memory, tool outputs,
+and model conclusions remain evidence rather than authenticated owner instructions.
+Completion requires verified effects, not merely command acceptance or observed output.
 
 ### Follow-up policies and recovery
 
@@ -249,11 +234,11 @@ the action's current revision and digest, schedules nothing when disabled or
 `maxAttempts` is zero, and never treats the command itself as a dispatch. Due
 execution proceeds only after the original action is confirmed. The runtime
 polls enabled policies, creates a new semantic action for each ordinal, rechecks
-current authorization/deadline/work state, enforces the attempt cap, and uses
+current policy/deadline/work state, enforces the attempt cap, and uses
 the real local-file/install/HTTP executor selected from the persisted
 action payload. A changed policy or action stops the old path; an ambiguous or
-rejected outcome stops further repeats, while approval-required work remains due
-until that exact derived action is authorized.
+cancelled outcome stops further repeats. Derived actions start as `planned` and
+proceed without per-action confirmation.
 
 `AssistantWorkRuntime` also recovers on boot. A `claimed_pre_effect` attempt for
 a supported local-file/install/HTTP action may resume through its real executor.
@@ -513,6 +498,6 @@ approval prompt.
   fire-and-forget and sequenced.
 - System/third-party observations can propose or schedule read-only discovery,
   but cannot mint owner provenance or authorize a mutation.
-- Managed effects use host classification, exact revision/digest fencing, and
-  verification; they are cooperative gates inside the daemon, not a claim that
-  the whole process is a hard sandbox.
+- Optional managed effects use host preflight, exact revision/digest fencing,
+  cancellation, execution records, and effect verification. Raw tools remain available
+  directly; OS permissions are independently enforced by macOS.

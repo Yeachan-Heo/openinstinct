@@ -13,23 +13,14 @@ import { toPlainText } from "./delivery/plaintext.ts";
 import { ChatHub, type ChatMessage, type OwnerSource } from "./chat/hub.ts";
 import { applyHistoryByteBudget, mergeOwnerHistory, readOwnerFacingHistory, stripOrientation, stripPanelMarker } from "./chat/history.ts";
 
-import { MANAGED_LOCAL_FILE_ACTION } from "./assistant-work/local-effects.ts";
-import { MANAGED_INSTALL_ACTION, parseManagedInstallPlan } from "./assistant-work/install.ts";
-import { isManagedHttpActionRecord } from "./assistant-work/http-effects.ts";
-import { isManagedOpaqueToolAction } from "./assistant-work/tool-gate.ts";
 import {
   applyOwnerFollowupCommand,
-  applyOwnerSendRuleCommand,
   ownerFollowupCommandResultText,
-  ownerSendRuleCommandResultText,
   parseOwnerFollowupCommand,
-  parseOwnerSendRuleCommand,
   type OwnerFollowupCommand,
   type OwnerFollowupCommandParseResult,
-  type OwnerSendRuleCommand,
-  type OwnerSendRuleCommandParseResult,
 } from "./assistant-work/owner-policy.ts";
-import { stableOwnerRuleId, type ActionRecord, type EvidenceProvenance } from "./assistant-work/model.ts";
+import type { ActionRecord, EvidenceProvenance } from "./assistant-work/model.ts";
 import type { NdjsonLogger } from "./log.ts";
 import type { MemoryClosureQueue } from "./memory/adapters/intents.ts";
 import {
@@ -60,7 +51,7 @@ export interface OwnerTurnRequest {
 export type AdmitOutcome = "started" | "steered" | "command" | "suppressed_paused" | "no_active_lane";
 
 export type OwnerActionCommand = {
-  readonly operation: "approve" | "reject";
+  readonly operation: "reject";
   readonly actionId: string;
   readonly revision: number;
   readonly digest: string;
@@ -70,17 +61,17 @@ export type OwnerActionCommandParseResult =
   | { readonly kind: "valid"; readonly command: OwnerActionCommand }
   | { readonly kind: "invalid"; readonly message: string };
 
-type OwnerHostCommandOperation = OwnerActionCommand["operation"] | OwnerSendRuleCommand["operation"] | OwnerFollowupCommand["operation"] | "invalid";
+ type OwnerHostCommandOperation = OwnerActionCommand["operation"] | OwnerFollowupCommand["operation"] | "invalid";
 
-const OWNER_ACTION_COMMAND_USAGE = "Use exactly /approve ACTION_ID REVISION DIGEST or /reject ACTION_ID REVISION DIGEST. Approval execution is available only for managed local-file, managed-install, and managed-HTTP actions.";
+const OWNER_ACTION_COMMAND_USAGE = "Use exactly /reject ACTION_ID REVISION DIGEST to cancel an action.";
 
-/** Recognizes only exact standalone commands; ordinary text is never authority. */
+/** Recognizes an exact cancellation command from authenticated owner ingress. */
 export function parseOwnerActionCommand(text: string): OwnerActionCommandParseResult | undefined {
   const trimmed = text.trim();
-  if (!/^\/(?:approve|reject)(?:\s|$)/.test(trimmed)) {
+  if (!/^\/reject(?:\s|$)/.test(trimmed)) {
     return undefined;
   }
-  const match = /^\/(approve|reject)\s+(\S+)\s+([1-9]\d*)\s+([a-f0-9]{64})$/.exec(trimmed);
+  const match = /^\/(reject)\s+(\S+)\s+([1-9]\d*)\s+([a-f0-9]{64})$/.exec(trimmed);
   if (!match) {
     return { kind: "invalid", message: OWNER_ACTION_COMMAND_USAGE };
   }
@@ -194,24 +185,20 @@ export class OwnerTurnIngress {
       return "suppressed_paused";
     }
     const actionCommand = parseOwnerActionCommand(request.text);
-    const sendRuleCommand = parseOwnerSendRuleCommand(request.text);
     const followupCommand = parseOwnerFollowupCommand(request.text);
-    const command = actionCommand ?? sendRuleCommand ?? followupCommand;
+    const command = actionCommand ?? followupCommand;
     const commandHasAttachments = command !== undefined && (
       (request.images !== undefined && request.images.length > 0)
       || stripPanelMarker(request.promptText).text.trim() !== request.text.trim()
     );
     if (commandHasAttachments) {
-      return this.completeOwnerActionCommand(request, "Owner authority commands must be sent as standalone text without attachments or quoted content.", options, {
+      return this.completeOwnerActionCommand(request, "Owner commands must be sent as standalone text without attachments or quoted content.", options, {
         operation: "invalid",
         applied: false,
       });
     }
     if (actionCommand !== undefined) {
       return this.handleOwnerActionCommand(request, actionCommand, options);
-    }
-    if (sendRuleCommand !== undefined) {
-      return this.handleOwnerSendRuleCommand(request, sendRuleCommand, options);
     }
     if (followupCommand !== undefined) {
       return this.handleOwnerFollowupCommand(request, followupCommand, options);
@@ -530,55 +517,6 @@ export class OwnerTurnIngress {
     }
   }
 
-  private async handleOwnerSendRuleCommand(
-    request: OwnerTurnRequest,
-    parsed: OwnerSendRuleCommandParseResult,
-    options: { readonly markRead?: boolean },
-  ): Promise<AdmitOutcome> {
-    if (parsed.kind === "invalid") {
-      return this.completeOwnerActionCommand(request, parsed.message, options, {
-        operation: parsed.operation,
-        applied: false,
-      });
-    }
-    const command = parsed.command;
-    const existingRule = command.operation === "allow_send"
-      ? this.deps.store.assistantWork.getOwnerRule(stableOwnerRuleId(command.matcher))
-      : this.deps.store.assistantWork.getOwnerRule(command.ruleId);
-    try {
-      const rule = applyOwnerSendRuleCommand({
-        repository: this.deps.store.assistantWork,
-        command,
-        provenance: ownerCommandProvenance(request, this.deps.outbox.handle),
-        now: new Date().toISOString(),
-      });
-      return this.completeOwnerActionCommand(
-        request,
-        ownerSendRuleCommandResultText(command, rule, {
-          changed: existingRule?.revision !== rule.revision || existingRule?.state !== rule.state,
-        }),
-        options,
-        {
-          operation: command.operation,
-          applied: true,
-          ruleId: rule.id,
-          revision: rule.revision,
-        },
-      );
-    } catch (error) {
-      return this.completeOwnerActionCommand(
-        request,
-        `Command was not applied: ${commandErrorMessage(error)}`,
-        options,
-        {
-          operation: command.operation,
-          applied: false,
-          ...(command.operation === "revoke_send" ? { ruleId: command.ruleId, revision: command.revision } : {}),
-        },
-      );
-    }
-  }
-
   private async handleOwnerActionCommand(
     request: OwnerTurnRequest,
     parsed: OwnerActionCommandParseResult,
@@ -620,54 +558,12 @@ export class OwnerTurnIngress {
         { operation: command.operation, applied: false, actionId: command.actionId, revision: command.revision },
       );
     }
-    if (command.operation === "approve" && !supportsManagedApproval(current)) {
-      return this.completeOwnerActionCommand(
-        request,
-        `Action ${command.actionId} uses unsupported executor ${current.action}. No approval or effect was applied.`,
-        options,
-        { operation: command.operation, applied: false, actionId: command.actionId, revision: command.revision },
-      );
-    }
-
-    if (command.operation === "reject") {
-      try {
-        this.deps.store.assistantWork.cancelAction({
-          actionId: command.actionId,
-          revision: command.revision,
-          digest: command.digest,
-          reason: `authenticated owner rejection (${provenance.evidenceId})`,
-        }, new Date().toISOString());
-      } catch (error) {
-        return this.completeOwnerActionCommand(
-          request,
-          `Command was not applied: ${commandErrorMessage(error)}`,
-          options,
-          { operation: command.operation, applied: false, actionId: command.actionId, revision: command.revision },
-        );
-      }
-      return this.completeOwnerActionCommand(
-        request,
-        `Rejected and cancelled action ${command.actionId} revision ${command.revision} digest ${command.digest}. It was not executed by this command.`,
-        options,
-        { operation: command.operation, applied: true, actionId: command.actionId, revision: command.revision },
-      );
-    }
-    const lane = this.deps.lanes();
-    if (lane === undefined) {
-      return this.completeOwnerActionCommand(
-        request,
-        `Action ${command.actionId} was not approved or executed because the assistant session is unavailable.`,
-        options,
-        { operation: command.operation, applied: false, actionId: command.actionId, revision: command.revision },
-      );
-    }
-
     try {
-      this.deps.store.assistantWork.grantExplicitApproval({
+      this.deps.store.assistantWork.cancelAction({
         actionId: command.actionId,
         revision: command.revision,
         digest: command.digest,
-        provenance,
+        reason: `authenticated owner cancellation (${provenance.evidenceId})`,
       }, new Date().toISOString());
     } catch (error) {
       return this.completeOwnerActionCommand(
@@ -677,14 +573,12 @@ export class OwnerTurnIngress {
         { operation: command.operation, applied: false, actionId: command.actionId, revision: command.revision },
       );
     }
-
-    this.logOwnerActionCommand(request, {
-      operation: command.operation,
-      applied: true,
-      actionId: command.actionId,
-      revision: command.revision,
-    });
-    return this.admitToLane(request, lane, options);
+    return this.completeOwnerActionCommand(
+      request,
+      `Cancelled action ${command.actionId} revision ${command.revision} digest ${command.digest}. It was not executed by this command.`,
+      options,
+      { operation: command.operation, applied: true, actionId: command.actionId, revision: command.revision },
+    );
   }
 
   private async completeOwnerActionCommand(
@@ -1126,19 +1020,6 @@ function ownerCommandProvenance(request: OwnerTurnRequest, ownerHandle: string |
       : "authenticated-local-owner",
     evidenceId: `owner-command:${request.source}:${request.turnId}`,
   };
-}
-
-function supportsManagedApproval(action: ActionRecord): boolean {
-  if (action.action === MANAGED_LOCAL_FILE_ACTION) return true;
-  if (isManagedHttpActionRecord(action)) return true;
-  if (isManagedOpaqueToolAction(action)) return true;
-  if (action.action !== MANAGED_INSTALL_ACTION) return false;
-  try {
-    parseManagedInstallPlan(action.payload);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 function commandErrorMessage(error: unknown): string {

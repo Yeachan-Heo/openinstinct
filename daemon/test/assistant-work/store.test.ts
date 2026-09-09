@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
-  authorizationRequirementForEffect,
+  EFFECT_CLASSES,
   stableAttemptId,
   stableObservationId,
   stableRecontactId,
@@ -19,12 +19,6 @@ import { openStateStore, SchemaVersionError } from "../../src/store/db.ts";
 import { MIGRATIONS } from "../../src/store/migrations.ts";
 
 const directories: string[] = [];
-const OWNER: EvidenceProvenance = {
-  principal: "owner",
-  channel: "chat",
-  subject: "owner-account",
-  evidenceId: "owner-turn-1",
-};
 const THIRD_PARTY: EvidenceProvenance = {
   principal: "third_party",
   channel: "mail",
@@ -200,22 +194,6 @@ describe("assistant-work durable identity", () => {
       preserved.close();
     }
   });
-  test("classifies autonomous, explicit-owner, rule-or-explicit, and blocked effects", () => {
-    expect(authorizationRequirementForEffect("ordinary_local_edit")).toBe("local_policy");
-    expect(authorizationRequirementForEffect("ordinary_local_install")).toBe("local_policy");
-    for (const effectClass of [
-      "delete_existing",
-      "bulk_existing_user_assets",
-      "core_setting_change",
-      "account_rights_change",
-      "cost_increase",
-      "external_mutation",
-    ] as const) {
-      expect(authorizationRequirementForEffect(effectClass)).toBe("owner_explicit");
-    }
-    expect(authorizationRequirementForEffect("external_message")).toBe("owner_rule_or_explicit");
-    expect(authorizationRequirementForEffect("uncovered")).toBe("blocked");
-  });
   test("migrates through v9 and deduplicates a stable source occurrence without duplicating work", () => {
     const store = openStateStore(stateDbPath());
     try {
@@ -256,7 +234,7 @@ describe("assistant-work durable identity", () => {
     }
   });
 
-  test("keeps action identity stable, increments material revisions, invalidates stale approval, and separates recontact ordinals", () => {
+  test("keeps action identity stable, rejects stale revisions, and separates recontact ordinals", () => {
     const store = openStateStore(stateDbPath());
     try {
       const work = admitWork(store).work;
@@ -268,12 +246,6 @@ describe("assistant-work durable identity", () => {
         payload: { value: "first" },
         scope: { service: "novel-service", record: "record-1" },
       }, T0);
-      const approval = store.assistantWork.grantExplicitApproval({
-        actionId: initial.id,
-        revision: initial.revision,
-        digest: initial.digest,
-        provenance: OWNER,
-      }, T1);
 
       const replay = store.assistantWork.proposeAction({
         workId: work.id,
@@ -293,9 +265,8 @@ describe("assistant-work durable identity", () => {
         payload: { value: "second" },
         scope: { service: "novel-service", record: "record-1" },
       }, T2);
-      expect(revised).toMatchObject({ id: initial.id, revision: 2, state: "approval_pending" });
+      expect(revised).toMatchObject({ id: initial.id, revision: 2, state: "planned" });
       expect(revised.digest).not.toBe(initial.digest);
-      expect(store.assistantWork.getExplicitApproval(approval.id)).toMatchObject({ state: "invalidated" });
 
       expect(store.assistantWork.claimForDispatch({
         actionId: initial.id,
@@ -308,9 +279,9 @@ describe("assistant-work durable identity", () => {
         actionId: revised.id,
         revision: revised.revision,
         digest: revised.digest,
-        attemptId: stableAttemptId(revised.id, revised.revision, "unapproved"),
+        attemptId: stableAttemptId(revised.id, revised.revision, "current"),
         workerId: "worker-a",
-      }, T3)).toMatchObject({ kind: "rejected", reason: "approval_required" });
+      }, T3)).toMatchObject({ kind: "claimed" });
 
       const firstRecontact = store.assistantWork.admitRecontact({
         actionId: revised.id,
@@ -344,365 +315,148 @@ describe("assistant-work durable identity", () => {
   });
 });
 
-describe("assistant-work authority and atomic claim", () => {
-  test("requires owner provenance and matches owner rules by recipient AND topic AND action", () => {
-    const store = openStateStore(stateDbPath());
+describe("assistant-work autonomous atomic dispatch", () => {
+  test("unsupported stored action states fail clearly without rewriting data or admitting attempts", () => {
+    const path = stateDbPath();
+    const initial = openStateStore(path);
+    const work = admitWork(initial, "historical").work;
+    const pending = initial.assistantWork.proposeAction(externalMessageAction(work.id, "pending"), T0);
+    const ready = initial.assistantWork.proposeAction(externalMessageAction(work.id, "ready"), T0);
+    const started = initial.assistantWork.proposeAction(externalMessageAction(work.id, "attempt"), T0);
+    const attemptInput = { actionId: started.id, revision: started.revision, digest: started.digest,
+      attemptId: "historical-attempt", workerId: "old-worker" };
+    initial.assistantWork.claimForDispatch(attemptInput, T0);
+    initial.close();
+    const database = new Database(path);
     try {
-      expect(() => store.assistantWork.setOwnerRule({
-        matcher: {
-          effectClass: "external_message",
-          recipient: "person@example.test",
-          topic: "contract-renewal",
-          action: "send_follow_up",
-        },
-        provenance: THIRD_PARTY,
-      }, T0)).toThrow("third_party evidence cannot create owner authorization");
-
-      const rule = store.assistantWork.setOwnerRule({
-        matcher: {
-          effectClass: "external_message",
-          recipient: "person@example.test",
-          topic: "contract-renewal",
-          action: "send_follow_up",
-        },
-        provenance: OWNER,
-      }, T0);
-      const work = admitWork(store, "rules").work;
-
-      const mismatches = [
-        externalMessageAction(work.id, "wrong-recipient", { recipient: "other@example.test" }),
-        externalMessageAction(work.id, "wrong-topic", { topic: "different-topic" }),
-        externalMessageAction(work.id, "wrong-action", { action: "send_invoice" }),
-      ];
-      for (const [index, proposal] of mismatches.entries()) {
-        const action = store.assistantWork.proposeAction(proposal, T1);
-        expect(store.assistantWork.claimForDispatch({
-          actionId: action.id,
-          revision: action.revision,
-          digest: action.digest,
-          attemptId: stableAttemptId(action.id, action.revision, `mismatch-${index}`),
-          workerId: "worker-a",
-        }, T2)).toMatchObject({ kind: "rejected", reason: "approval_required" });
+      database.query("UPDATE assistant_work_actions SET state = ? WHERE id = ?").run("approval_pending", pending.id);
+      database.query("UPDATE assistant_work_actions SET state = ? WHERE id = ?").run("authorized", ready.id);
+      database.query("UPDATE assistant_work_attempts SET authorization_source = 'owner_rule', authorization_id = 'historical-rule', authorization_revision = 1 WHERE id = ?").run(attemptInput.attemptId);
+    } finally { database.close(); }
+    const reopened = openStateStore(path);
+    try {
+      const listing = reopened.assistantWork.listActions(work.id);
+      expect(listing.actions.map((action) => action.id)).toEqual([started.id]);
+      expect(listing.unsupported).toEqual([
+        { kind: "unsupported_action_state", actionId: pending.id, workId: work.id,
+          state: "approval_pending", revision: pending.revision, digest: pending.digest },
+        { kind: "unsupported_action_state", actionId: ready.id, workId: work.id,
+          state: "authorized", revision: ready.revision, digest: ready.digest },
+      ]);
+      expect(reopened.assistantWork.listActions()).toEqual(listing);
+      const healthyWork = admitWork(reopened, "healthy-unrelated").work;
+      const healthy = reopened.assistantWork.proposeAction(externalMessageAction(healthyWork.id), T1);
+      expect(reopened.assistantWork.listActions(healthyWork.id)).toEqual({ actions: [healthy], unsupported: [] });
+      expect(reopened.assistantWork.claimForDispatch({ actionId: healthy.id, revision: healthy.revision,
+        digest: healthy.digest, attemptId: "healthy-dispatch", workerId: "new-worker" }, T1))
+        .toMatchObject({ kind: "claimed" });
+      for (const action of [pending, ready]) {
+        expect(() => reopened.assistantWork.getAction(action.id)).toThrow("unsupported assistant action state");
+        expect(() => reopened.assistantWork.claimForDispatch({ actionId: action.id, revision: action.revision,
+          digest: action.digest, attemptId: `${action.id}-dispatch`, workerId: "new-worker" }, T1))
+          .toThrow("unsupported assistant action state");
+        expect(reopened.assistantWork.listAttempts(action.id)).toHaveLength(0);
       }
-
-      const matching = store.assistantWork.proposeAction(externalMessageAction(work.id, "matching"), T1);
-      const claim = store.assistantWork.claimForDispatch({
-        actionId: matching.id,
-        revision: matching.revision,
-        digest: matching.digest,
-        attemptId: stableAttemptId(matching.id, matching.revision, "matching"),
-        workerId: "worker-a",
-      }, T2);
-      expect(claim).toMatchObject({
-        kind: "claimed",
-        resumed: false,
-        attempt: {
-          state: "claimed_pre_effect",
-          authorizationSource: "owner_rule",
-          authorizationId: rule.id,
-          authorizationRevision: rule.revision,
-        },
-      });
-    } finally {
-      store.close();
-    }
+      expect(reopened.assistantWork.recoverAttempt({ attemptId: attemptInput.attemptId, workerId: "new-worker" }, T1))
+        .toMatchObject({ kind: "resume_pre_effect", attempt: { id: attemptInput.attemptId, recoveryCount: 1 } });
+      expect(reopened.assistantWork.listAttempts(started.id)).toHaveLength(1);
+    } finally { reopened.close(); }
+    const preserved = new Database(path, { readonly: true });
+    try {
+      expect(preserved.query("SELECT state, current_digest FROM assistant_work_actions WHERE id = ?").get(pending.id))
+        .toEqual({ state: "approval_pending", current_digest: pending.digest });
+      expect(preserved.query("SELECT state, current_digest FROM assistant_work_actions WHERE id = ?").get(ready.id))
+        .toEqual({ state: "authorized", current_digest: ready.digest });
+      expect(preserved.query("SELECT count(*) AS count FROM assistant_work_actions WHERE work_id = ?").get(work.id))
+        .toEqual({ count: 3 });
+    } finally { preserved.close(); }
   });
 
-  test("consumes one explicit approval with the claim and lets only one StateStore connection win", () => {
+  test("cancelling a claimed delete fences effect start and recovery", () => {
+    const store = openStateStore(stateDbPath());
+    try {
+      const work = admitWork(store, "cancel-claimed").work;
+      const action = store.assistantWork.proposeAction({ ...externalMessageAction(work.id), effectClass: "delete_existing" }, T0);
+      const input = { actionId: action.id, revision: action.revision, digest: action.digest,
+        attemptId: "cancelled-attempt", workerId: "worker" };
+      store.assistantWork.claimForDispatch(input, T0);
+      store.assistantWork.cancelAction({ ...input, reason: "withdrawn" }, T1);
+      expect(() => store.assistantWork.markEffectStarted(input, T2)).toThrow("external effect must not be invoked or repeated");
+      expect(store.assistantWork.recoverAttempt(input, T2)).toMatchObject({ kind: "terminal_no_replay", attempt: { state: "cancelled" } });
+      expect(store.assistantWork.listAttempts(action.id)).toHaveLength(1);
+    } finally { store.close(); }
+  });
+  test("all supported effects dispatch without grants and only one connection wins", () => {
     const path = stateDbPath();
     const first = openStateStore(path);
     const second = openStateStore(path);
     try {
-      const work = admitWork(first, "concurrent").work;
-      const action = first.assistantWork.proposeAction({
-        workId: work.id,
-        semanticKey: "delete-file",
-        effectClass: "delete_existing",
-        action: "delete_file",
-        payload: { path: "/tmp/existing-user-file" },
-        scope: { existing: true },
-      }, T0);
-      const approval = first.assistantWork.grantExplicitApproval({
-        actionId: action.id,
-        revision: action.revision,
-        digest: action.digest,
-        provenance: OWNER,
-      }, T1);
-
-      expect(() => first.assistantWork.grantExplicitApproval({
-        actionId: action.id,
-        revision: action.revision,
-        digest: action.digest,
-        provenance: { ...THIRD_PARTY, evidenceId: "malicious-approval" },
-      }, T1)).toThrow("third_party evidence cannot create owner authorization");
-
-      const winningAttemptId = stableAttemptId(action.id, action.revision, "winner");
-      const winner = first.assistantWork.claimForDispatch({
-        actionId: action.id,
-        revision: action.revision,
-        digest: action.digest,
-        attemptId: winningAttemptId,
-        workerId: "worker-a",
-      }, T2);
-      const replayedWinner = first.assistantWork.claimForDispatch({
-        actionId: action.id,
-        revision: action.revision,
-        digest: action.digest,
-        attemptId: winningAttemptId,
-        workerId: "worker-a",
-      }, T2);
-      const loser = second.assistantWork.claimForDispatch({
-        actionId: action.id,
-        revision: action.revision,
-        digest: action.digest,
-        attemptId: stableAttemptId(action.id, action.revision, "loser"),
-        workerId: "worker-b",
-      }, T2);
-
-      expect(winner).toMatchObject({
-        kind: "claimed",
-        attempt: { authorizationSource: "owner_explicit", authorizationId: approval.id },
-      });
-      expect(replayedWinner).toMatchObject({
-        kind: "claimed",
-        resumed: true,
-        attempt: { id: winningAttemptId },
-      });
-      expect(loser).toMatchObject({
-        kind: "rejected",
-        reason: "already_claimed",
-        attempt: { id: winningAttemptId },
-      });
-      expect(first.assistantWork.getExplicitApproval(approval.id)).toMatchObject({
-        state: "consumed",
-        consumedAttemptId: winningAttemptId,
-      });
-      expect(first.assistantWork.listAttempts(action.id)).toHaveLength(1);
-    } finally {
-      second.close();
-      first.close();
-    }
+      const work = admitWork(first, "supported").work;
+      for (const effectClass of EFFECT_CLASSES.filter((value) => value !== "uncovered")) {
+        const action = first.assistantWork.proposeAction({
+          ...externalMessageAction(work.id, effectClass), effectClass,
+        }, T0);
+        const input = { actionId: action.id, revision: action.revision, digest: action.digest,
+          attemptId: stableAttemptId(action.id, action.revision, "winner"), workerId: "worker-a" };
+        expect(first.assistantWork.claimForDispatch(input, T1)).toMatchObject({ kind: "claimed", resumed: false });
+        expect(second.assistantWork.claimForDispatch({ ...input, attemptId: `${input.attemptId}-other`, workerId: "worker-b" }, T1))
+          .toMatchObject({ kind: "rejected", reason: "already_claimed" });
+        expect(first.assistantWork.claimForDispatch(input, T1)).toMatchObject({ kind: "claimed", resumed: true });
+        first.assistantWork.markEffectStarted(input, T1);
+        first.assistantWork.confirmAttempt({ ...input, outcome: { receipt: effectClass } }, T2);
+        expect(second.assistantWork.claimForDispatch({ ...input, attemptId: `${input.attemptId}-duplicate` }, T3))
+          .toMatchObject({ kind: "rejected", reason: "confirmed" });
+        expect(first.assistantWork.listAttempts(action.id)).toHaveLength(1);
+      }
+    } finally { second.close(); first.close(); }
   });
 
-  test("rechecks rule revocation, cancellation, and deadline inside claim", () => {
+  test("stale digests, cancellation, deadlines and terminal work still prevent effects", () => {
     const store = openStateStore(stateDbPath());
     try {
-      const rule = store.assistantWork.setOwnerRule({
-        matcher: {
-          effectClass: "external_message",
-          recipient: "person@example.test",
-          topic: "contract-renewal",
-          action: "send_follow_up",
-        },
-        provenance: OWNER,
-      }, T0);
-      const work = admitWork(store, "current-policy").work;
-      const ruledAction = store.assistantWork.proposeAction(externalMessageAction(work.id, "revoked-rule"), T0);
-      store.assistantWork.revokeOwnerRule(rule.id, rule.revision, { ...OWNER, evidenceId: "owner-turn-revoke" }, T1);
-      expect(store.assistantWork.claimForDispatch({
-        actionId: ruledAction.id,
-        revision: ruledAction.revision,
-        digest: ruledAction.digest,
-        attemptId: stableAttemptId(ruledAction.id, ruledAction.revision, "revoked"),
-        workerId: "worker-a",
-      }, T2)).toMatchObject({ kind: "rejected", reason: "approval_required" });
-
-      const cancelled = store.assistantWork.proposeAction({
-        workId: work.id,
-        semanticKey: "cancelled-delete",
-        effectClass: "delete_existing",
-        action: "delete_file",
-        payload: { path: "/tmp/cancelled" },
-      }, T0);
-      store.assistantWork.grantExplicitApproval({
-        actionId: cancelled.id,
-        revision: cancelled.revision,
-        digest: cancelled.digest,
-        provenance: { ...OWNER, evidenceId: "owner-turn-cancelled" },
-      }, T1);
-      store.assistantWork.cancelAction({
-        actionId: cancelled.id,
-        revision: cancelled.revision,
-        digest: cancelled.digest,
-        reason: "source request was withdrawn",
-      }, T2);
-      expect(store.assistantWork.claimForDispatch({
-        actionId: cancelled.id,
-        revision: cancelled.revision,
-        digest: cancelled.digest,
-        attemptId: stableAttemptId(cancelled.id, cancelled.revision, "cancelled"),
-        workerId: "worker-a",
-      }, T2)).toMatchObject({ kind: "rejected", reason: "cancelled" });
-
-      const expiring = store.assistantWork.proposeAction({
-        workId: work.id,
-        semanticKey: "expired-update",
-        effectClass: "external_mutation",
-        action: "submit_form",
-        payload: { value: "expired" },
-        deadlineAt: T2,
-      }, T0);
-      const expiryApproval = store.assistantWork.grantExplicitApproval({
-        actionId: expiring.id,
-        revision: expiring.revision,
-        digest: expiring.digest,
-        provenance: { ...OWNER, evidenceId: "owner-turn-expiring" },
-      }, T1);
-      expect(store.assistantWork.claimForDispatch({
-        actionId: expiring.id,
-        revision: expiring.revision,
-        digest: expiring.digest,
-        attemptId: stableAttemptId(expiring.id, expiring.revision, "expired"),
-        workerId: "worker-a",
-      }, T2)).toMatchObject({ kind: "rejected", reason: "expired" });
-      expect(store.assistantWork.getExplicitApproval(expiryApproval.id)).toMatchObject({ state: "invalidated" });
-    } finally {
-      store.close();
-    }
+      const work = admitWork(store, "bounds").work;
+      for (const reason of ["stale_digest", "cancelled", "expired", "terminal"] as const) {
+        const action = store.assistantWork.proposeAction({
+          ...externalMessageAction(work.id, reason),
+          ...(reason === "expired" ? { deadlineAt: T1 } : {}),
+        }, T0);
+        const input = { actionId: action.id, revision: action.revision, digest: action.digest,
+          attemptId: stableAttemptId(action.id, action.revision, reason), workerId: "worker" };
+        if (reason === "cancelled") store.assistantWork.cancelAction({ ...input, reason: "withdrawn" }, T0);
+        if (reason === "terminal") store.assistantWork.setWorkState(work.id, "completed", T0);
+        expect(store.assistantWork.claimForDispatch({ ...input, ...(reason === "stale_digest" ? { digest: "0".repeat(64) } : {}) }, T1))
+          .toMatchObject({ kind: "rejected", reason });
+        expect(store.assistantWork.listAttempts(action.id)).toHaveLength(0);
+      }
+    } finally { store.close(); }
   });
 
-  test("uses only ordinary local edit/install as autonomous policy and blocks uncovered paths with evidence", () => {
+  test("uncovered material stays blocked rather than waiting for permission", () => {
     const store = openStateStore(stateDbPath());
     try {
-      const work = admitWork(store, "effect-classes").work;
-      const install = store.assistantWork.proposeAction({
-        workId: work.id,
-        semanticKey: "install-package",
-        effectClass: "ordinary_local_install",
-        action: "install_package",
-        payload: { package: "existing-approved-tool" },
-        scope: { generatedOutputPaths: ["one", "two", "three"] },
-      }, T0);
-      expect(store.assistantWork.claimForDispatch({
-        actionId: install.id,
-        revision: install.revision,
-        digest: install.digest,
-        attemptId: stableAttemptId(install.id, install.revision, "local-install"),
-        workerId: "worker-a",
-      }, T1)).toMatchObject({
-        kind: "claimed",
-        attempt: { authorizationSource: "local_policy" },
-      });
-
-      const rights = store.assistantWork.proposeAction({
-        workId: work.id,
-        semanticKey: "grant-rights",
-        effectClass: "account_rights_change",
-        action: "grant_rights",
-        payload: { right: "admin" },
-      }, T0);
-      expect(store.assistantWork.claimForDispatch({
-        actionId: rights.id,
-        revision: rights.revision,
-        digest: rights.digest,
-        attemptId: stableAttemptId(rights.id, rights.revision, "rights"),
-        workerId: "worker-a",
-      }, T1)).toMatchObject({ kind: "rejected", reason: "approval_required" });
-
-      const uncovered = store.assistantWork.proposeAction({
-        workId: work.id,
-        semanticKey: "unmanaged-effect",
-        effectClass: "uncovered",
-        action: "invoke_unmanaged_path",
-        payload: { path: "unknown" },
-        blockedEvidence: { reason: "no cooperative effect hook" },
-      }, T0);
-      expect(uncovered).toMatchObject({ state: "blocked", blockedEvidence: { reason: "no cooperative effect hook" } });
-      expect(store.assistantWork.claimForDispatch({
-        actionId: uncovered.id,
-        revision: uncovered.revision,
-        digest: uncovered.digest,
-        attemptId: stableAttemptId(uncovered.id, uncovered.revision, "blocked"),
-        workerId: "worker-a",
-      }, T1)).toMatchObject({ kind: "rejected", reason: "blocked" });
-    } finally {
-      store.close();
-    }
+      const work = admitWork(store, "uncovered").work;
+      const action = store.assistantWork.proposeAction({ workId: work.id, semanticKey: "unknown",
+        effectClass: "uncovered", action: "unknown", payload: {}, blockedEvidence: { reason: "unsupported" } }, T0);
+      expect(store.assistantWork.claimForDispatch({ actionId: action.id, revision: action.revision, digest: action.digest,
+        attemptId: "uncovered-attempt", workerId: "worker" }, T1)).toMatchObject({ kind: "rejected", reason: "blocked" });
+    } finally { store.close(); }
   });
 });
 
 describe("assistant-work crash boundaries", () => {
-  test("rechecks owner-rule revision and deadline before resuming a pre-effect attempt", () => {
+  test("deadline expiry fences both direct effect start and pre-effect recovery", () => {
     const store = openStateStore(stateDbPath());
     try {
-      const rule = store.assistantWork.setOwnerRule({
-        matcher: {
-          effectClass: "external_message",
-          recipient: "person@example.test",
-          topic: "contract-renewal",
-          action: "send_follow_up",
-        },
-        provenance: OWNER,
-      }, T0);
-      const work = admitWork(store, "recovery-policy").work;
-      const ruledAction = store.assistantWork.proposeAction(
-        externalMessageAction(work.id, "recovery-rule"),
-        T0,
-      );
-      const ruledAttemptId = stableAttemptId(ruledAction.id, ruledAction.revision, "recovery-rule");
-      store.assistantWork.claimForDispatch({
-        actionId: ruledAction.id,
-        revision: ruledAction.revision,
-        digest: ruledAction.digest,
-        attemptId: ruledAttemptId,
-        workerId: "worker-before-restart",
-      }, T1);
-      store.assistantWork.revokeOwnerRule(
-        rule.id,
-        rule.revision,
-        { ...OWNER, evidenceId: "owner-turn-revoke-before-recovery" },
-        T2,
-      );
-
-      const revokedRecovery = store.assistantWork.recoverAttempt({
-        attemptId: ruledAttemptId,
-        workerId: "worker-after-restart",
-      }, T3);
-      expect(revokedRecovery).toMatchObject({
-        kind: "terminal_no_replay",
-        action: { state: "approval_pending" },
-        attempt: {
-          state: "cancelled",
-          workerId: "worker-before-restart",
-          outcome: { reason: "authorization_no_longer_current" },
-        },
-      });
-      expect(revokedRecovery.action.activeAttemptId).toBeUndefined();
-
-      const expiringAction = store.assistantWork.proposeAction({
-        workId: work.id,
-        semanticKey: "recovery-deadline",
-        effectClass: "ordinary_local_edit",
-        action: "write_file",
-        payload: { path: "/tmp/deadline", body: "content" },
-        deadlineAt: T2,
-      }, T0);
-      const expiringAttemptId = stableAttemptId(expiringAction.id, expiringAction.revision, "recovery-deadline");
-      store.assistantWork.claimForDispatch({
-        actionId: expiringAction.id,
-        revision: expiringAction.revision,
-        digest: expiringAction.digest,
-        attemptId: expiringAttemptId,
-        workerId: "worker-before-restart",
-      }, T1);
-
-      const expiredRecovery = store.assistantWork.recoverAttempt({
-        attemptId: expiringAttemptId,
-        workerId: "worker-after-restart",
-      }, T2);
-      expect(expiredRecovery).toMatchObject({
-        kind: "terminal_no_replay",
-        action: { state: "expired" },
-        attempt: {
-          state: "cancelled",
-          workerId: "worker-before-restart",
-          outcome: { reason: "deadline_expired" },
-        },
-      });
-      expect(expiredRecovery.action.activeAttemptId).toBeUndefined();
-    } finally {
-      store.close();
-    }
+      const work = admitWork(store, "deadline").work;
+      const action = store.assistantWork.proposeAction({ ...externalMessageAction(work.id), deadlineAt: T2 }, T0);
+      const input = { actionId: action.id, revision: action.revision, digest: action.digest,
+        attemptId: "deadline-attempt", workerId: "worker" };
+      expect(store.assistantWork.claimForDispatch(input, T1)).toMatchObject({ kind: "claimed" });
+      expect(() => store.assistantWork.markEffectStarted(input, T2)).toThrow("deadline");
+      expect(store.assistantWork.claimForDispatch(input, T2)).toMatchObject({ kind: "rejected", reason: "expired" });
+      expect(store.assistantWork.recoverAttempt(input, T2)).toMatchObject({ kind: "terminal_no_replay",
+        action: { state: "expired" }, attempt: { state: "cancelled", outcome: { reason: "deadline_expired" } } });
+    } finally { store.close(); }
   });
   test("recovers claimed_pre_effect with the same attempt but makes a started effect ambiguous without takeover", () => {
     const path = stateDbPath();
@@ -714,12 +468,6 @@ describe("assistant-work crash boundaries", () => {
       effectClass: "external_mutation",
       action: "update_record",
       payload: { service: "fixture", record: "record-1", value: "content" },
-    }, T0);
-    initial.assistantWork.grantExplicitApproval({
-      actionId: action.id,
-      revision: action.revision,
-      digest: action.digest,
-      provenance: { ...OWNER, evidenceId: "owner-turn-recovery" },
     }, T0);
     const attemptId = stableAttemptId(action.id, action.revision, "recovery");
     expect(initial.assistantWork.claimForDispatch({

@@ -2,10 +2,12 @@ import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { stableNotificationId } from "../../daemon/src/assistant-work/model.ts";
 import { setDaemonPaused } from "../../daemon/src/control/pause.ts";
 import { bindChatCursor } from "../../daemon/src/imessage/reader.ts";
 import { MonitorStore } from "../../daemon/src/monitors/store.ts";
 import { dataPaths } from "../../daemon/src/paths.ts";
+import { readPersistedOwnerReplies } from "../../daemon/src/sdk-session/main-session.ts";
 import { openStateStore } from "../../daemon/src/store/index.ts";
 
 const [action, drill, home, firstLog] = process.argv.slice(2);
@@ -167,10 +169,43 @@ function assertRecovery(drill: string, home: string, firstLog: string | undefine
         break;
       }
       case "mid-propagation": {
-        const event = store.listMonitorEvents().find((entry) => entry.monitorId === "drill-monitor");
-        const deliveries = store.listDeliveries().filter((delivery) => delivery.idempotencyKey.startsWith("monitor-event:"));
-        if (event?.stage !== "delivered" || deliveries.length !== 1) {
-          throw new Error(`expected propagated event delivered once, got stage=${String(event?.stage)} deliveries=${deliveries.length}`);
+        if (!firstLog || !readFileSync(firstLog, "utf8").includes("OI_DRILL_HOLD_REACHED mid-propagation")) {
+          throw new Error("expected crash after owner-notification admission at mid-propagation");
+        }
+        const events = store.listMonitorEvents().filter((entry) => entry.monitorId === "drill-monitor");
+        const event = events[0];
+        if (events.length !== 1 || event?.stage !== "delivered" || !event.childId) {
+          throw new Error(`expected one recovered delivered monitor event, got count=${events.length} stage=${String(event?.stage)}`);
+        }
+        const intentKey = `monitor-event:${event.id}`;
+        const notificationId = stableNotificationId("main-session", intentKey);
+        const replies = readPersistedOwnerReplies(store).filter((reply) => reply.idempotencyKey === intentKey);
+        const notices = store.assistantWork.listNotifications();
+        const notice = notices.find((entry) => entry.id === notificationId);
+        if (event.deliveryIntentKey !== intentKey || replies.length !== 1 || replies[0]?.text !== "Hermetic drill reply."
+          || notices.length !== 1 || !notice || notice.body !== replies[0]?.text) {
+          throw new Error(`expected one durable MainSession reply and stable notification, got replies=${replies.length} notices=${notices.length} notification=${String(notice?.id)}`);
+        }
+        // No panel activity is seeded: adaptive routing must confirm iMessage,
+        // not silently stop at Chat persistence or monitor stage completion.
+        const routes = store.assistantWork.getNotificationWithRoutes(notificationId)?.routes ?? [];
+        const deliveries = store.listDeliveries();
+        const delivery = deliveries.find((entry) => entry.idempotencyKey === `assistant-notification:${notificationId}`);
+        if (routes.length !== 1 || routes[0]?.route !== "imessage" || routes[0]?.state !== "delivered"
+          || deliveries.length !== 1 || delivery?.state !== "confirmed" || delivery.attempts !== 1
+          || delivery.body !== notice.body || routes[0]?.externalId !== delivery.id) {
+          throw new Error(`expected exactly one confirmed notification send and reconciled iMessage route, got routes=${JSON.stringify(routes)} deliveries=${JSON.stringify(deliveries)}`);
+        }
+        const children = store.listChildren();
+        const receipts = store.listReceipts();
+        if (children.length !== 1 || children[0]?.id !== event.childId || children[0]?.state !== "completed"
+          || receipts.length !== 1 || receipts[0]?.childId !== event.childId || receipts[0]?.state !== "delivered") {
+          throw new Error(`expected one completed child and consumed receipt without redispatch, got children=${children.length} receipts=${receipts.length}`);
+        }
+        const delivered = readNdjson(paths.daemonLog)
+          .filter((entry) => entry.event === "delivered" && entry.monitorEventId === event.id);
+        if (delivered.length !== 1 || delivered[0]?.silent === true) {
+          throw new Error(`expected one non-silent propagation settlement after recovery, got ${JSON.stringify(delivered)}`);
         }
         break;
       }

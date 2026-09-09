@@ -27,7 +27,7 @@ import { loadRuntimeBlock } from "../src/persona/soul.ts";
 describe("runtime block", () => {
   test("renders a detached chat-only runtime without unreplaced lane placeholders", () => {
     const block = loadRuntimeBlock({ imessage: "detached", ownerName: "Ada", chromeProfile: "/x/chrome" });
-    expect(block.version).toBe("14");
+    expect(block.version).toBe("16");
     expect(block.text).toContain("The owner is Ada.");
     expect(block.text).toContain("(no iMessage number configured)");
     expect(block.text).toContain("not connected right now");
@@ -47,11 +47,31 @@ describe("runtime block", () => {
 
   test("renders the configured handle and connected lane state", () => {
     const block = loadRuntimeBlock({ ownerHandle: "+15550001111", imessage: "attached", ownerName: "Ada", chromeProfile: "/x/chrome" });
-    expect(block.version).toBe("14");
+    expect(block.version).toBe("16");
     expect(block.text).toContain("over iMessage at +15550001111");
     expect(block.text).toContain("iMessage is connected");
     expect(block.text).not.toContain("{{");
     expect(loadRuntimeBlock({ ownerHandle: "+1", imessage: "attached", ownerName: "", chromeProfile: "/x" }).text).toContain("over iMessage at +1");
+  });
+
+  test("uses direct execution and truthful OS access without application approval", () => {
+    const { text } = loadRuntimeBlock({ imessage: "detached", ownerName: "Ada", chromeProfile: "/x/chrome" });
+    expect(text).toContain("proceed directly using available tools without confirmation round trips");
+    expect(text).toContain("optional durable verification tools, not required routes");
+    expect(text).toContain("Full Disk Access is the required OS-capability baseline, including Chat-only use");
+    expect(text).toContain("Never claim it is granted without a successful access probe");
+    expect(text).toContain("`/reject ACTION_ID REVISION DIGEST`");
+    expect(text).toContain("`/followup");
+    expect(text).toContain("exact action ID, revision, and digest");
+    expect(text).toContain("check for duplicate effects before retrying");
+    expect(text).toContain("never owner provenance");
+    expect(text).not.toMatch(/\/approve|\/allow-send|\/revoke-send|approval_pending|authorized|managed SDK gate|cooperative gates/);
+    expect(text).not.toContain("Raw write/edit must go through");
+    expect(text).toContain("native task, subagent, and job tools remain available");
+    expect(text).toContain("no application-enforced shell timeout or fixed tool-call budget");
+    expect(text).toContain("ignoreScripts=false");
+    expect(text).not.toContain("Never read ~/.openinstinct");
+    expect(text).not.toContain("the runtime blocks");
   });
 });
 

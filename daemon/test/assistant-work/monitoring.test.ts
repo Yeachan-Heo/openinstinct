@@ -86,7 +86,8 @@ describe("service-neutral assistant monitoring", () => {
       expect(first.monitor?.instruction).toContain("Observe only");
       expect(first.monitor?.instruction).toContain(input.serviceReference);
       expect(first.monitor?.instruction).toContain(input.accountReference);
-      expect(first.monitor?.instruction).toContain("not OS-level confinement");
+      expect(first.monitor?.instruction).toContain("Use available runtime tools as needed");
+      expect(first.monitor?.instruction).not.toContain("approval");
       expect(first.monitor?.instruction).toContain("assistant_service_observation");
       expect(replay).toMatchObject({ disposition: "track", operation: "replayed", changed: false, monitor: { revision: 1 } });
       expect(first.monitor?.enabled).toBe(true);
@@ -219,7 +220,7 @@ describe("service-neutral assistant monitoring", () => {
       });
       expect(textOf(result)).toContain("uncertain proposal only");
       expect(h.monitors.list()).toHaveLength(0);
-      expect(h.store.assistantWork.listActions()).toHaveLength(0);
+      expect(h.store.assistantWork.listActions()).toEqual({ actions: [], unsupported: [] });
       expect(h.store.assistantWork.listObservations()).toMatchObject([{
         provenance: { channel: "monitor_child_tool", principal: "third_party" },
         evidence: { decision: { disposition: "propose", intervalMs: 1_800_000 } },

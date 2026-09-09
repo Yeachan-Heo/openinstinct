@@ -10,6 +10,28 @@ import { SdkMainSessionFactory, openMainSession } from "../../src/sdk-session/ma
 
 const directories: string[] = [];
 
+type DiscoverySession = {
+  getActiveToolNames(): string[];
+  getDiscoverableTools(filter: { source: "builtin" }): Array<{ name: string }>;
+  activateDiscoveredTools(names: string[]): Promise<string[]>;
+};
+
+async function expectNativeWorkerDiscovery(session: DiscoverySession): Promise<void> {
+  const names = ["task", "subagent", "job"];
+  const discoverable = session.getDiscoverableTools({ source: "builtin" }).map((tool) => tool.name);
+  for (const name of names) {
+    expect(session.getActiveToolNames()).not.toContain(name);
+    expect(discoverable).toContain(name);
+  }
+  const activated = await session.activateDiscoveredTools(names);
+  for (const name of names) {
+    expect(activated).toContain(name);
+    expect(session.getActiveToolNames()).toContain(name);
+  }
+  expect(session.getActiveToolNames()).toContain("browser");
+  expect(session.getActiveToolNames()).not.toContain("irc");
+}
+
 afterEach(() => {
   for (const directory of directories.splice(0)) {
     rmSync(directory, { recursive: true, force: true });
@@ -33,6 +55,9 @@ describe("SDK session registry isolation", () => {
     try {
       const active = (session as unknown as { getActiveToolNames(): string[] }).getActiveToolNames();
       expect(active).not.toContain("irc");
+      expect(active).toContain("browser");
+      expect((session as unknown as { readonly sdkPermissionMode: string }).sdkPermissionMode).toBe("allow");
+      await expectNativeWorkerDiscovery(session as unknown as DiscoverySession);
       expect(AgentRegistry.global().list()).toEqual(globalBefore);
       expect(factory.agentRegistry.list()).toHaveLength(1);
       expect(factory.agentRegistry.list()[0]).toMatchObject({
@@ -62,6 +87,11 @@ describe("SDK session registry isolation", () => {
     try {
       const active = (main as unknown as { readonly session: { getActiveToolNames(): string[] } }).session.getActiveToolNames();
       expect(active).not.toContain("irc");
+      expect(active).toContain("browser");
+      expect(active).toContain("delegate_background");
+      expect(active).toContain("send_image");
+      expect((main as unknown as { readonly session: { readonly sdkPermissionMode: string } }).session.sdkPermissionMode).toBe("allow");
+      await expectNativeWorkerDiscovery((main as unknown as { readonly session: DiscoverySession }).session);
       expect(AgentRegistry.global().list()).toEqual(globalBefore);
       expect(factory.agentRegistry.list()).toHaveLength(1);
       expect(factory.agentRegistry.list()[0]).toMatchObject({

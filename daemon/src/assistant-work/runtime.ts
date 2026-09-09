@@ -54,8 +54,12 @@ export class AssistantWorkRuntime {
   private async drainOnce(): Promise<void> {
     if (this.stopped || this.options.isPaused()) return;
     if (!this.recovered) {
-      await this.recovery.recover();
-      this.recovered = true;
+      try {
+        await this.recovery.recover();
+        this.recovered = true;
+      } catch (error) {
+        this.options.onError(new Error("Assistant work startup recovery failed", { cause: error }));
+      }
     }
     for (const attempt of this.options.store.assistantWork.listRecoveryCandidates()) {
       if (this.stopped || this.options.isPaused()) return;
@@ -69,7 +73,12 @@ export class AssistantWorkRuntime {
     }
     for (const policy of this.options.store.assistantWork.listFollowupPolicies()) {
       if (this.stopped || this.options.isPaused()) return;
-      if (policy.enabled) await this.recovery.tick(policy.workId);
+      if (!policy.enabled) continue;
+      try {
+        await this.recovery.tick(policy.workId);
+      } catch (error) {
+        this.options.onError(new Error(`Assistant work followup failed for work ${policy.workId} action ${policy.actionId}`, { cause: error }));
+      }
     }
     for (const entry of this.options.store.assistantWork.listPendingFollowupReports()) {
       if (this.stopped || this.options.isPaused()) return;
@@ -81,8 +90,12 @@ export class AssistantWorkRuntime {
         ...(entry.dispatchId === undefined ? {} : { dispatchId: entry.dispatchId }),
         detail: entry.detail,
       };
-      if (await this.options.report(report, entry.id)) {
-        this.options.store.assistantWork.markFollowupReportAdmitted(entry.id, new Date().toISOString());
+      try {
+        if (await this.options.report(report, entry.id)) {
+          this.options.store.assistantWork.markFollowupReportAdmitted(entry.id, new Date().toISOString());
+        }
+      } catch (error) {
+        this.options.onError(new Error(`Assistant work report ${entry.id} failed`, { cause: error }));
       }
     }
   }

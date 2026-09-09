@@ -19,15 +19,14 @@ export const EFFECT_CLASSES = [
   "external_mutation", "uncovered",
 ] as const;
 export type EffectClass = typeof EFFECT_CLASSES[number];
-export type AuthorizationRequirement = "local_policy" | "owner_explicit" | "owner_rule_or_explicit" | "blocked";
 
 export interface ActionMaterial {
   readonly effectClass: EffectClass;
-  /** Exact caller-canonical key used by owner-rule matching. */
+  /** Caller-canonical recipient key included in the material digest. */
   readonly recipient?: string;
-  /** Exact caller-canonical key used by owner-rule matching. */
+  /** Caller-canonical topic key included in the material digest. */
   readonly topic?: string;
-  /** Exact caller-canonical key used by owner-rule matching. */
+  /** Caller-canonical action key included in the material digest. */
   readonly action: string;
   readonly payload: JsonValue;
   readonly scope?: JsonValue;
@@ -41,21 +40,27 @@ export interface ProposeActionInput extends ActionMaterial {
   /** Stable semantic-effect key within the work. */
   readonly semanticKey: string;
 }
-export type ActionState = "planned" | "approval_pending" | "authorized" | "claimed_pre_effect" | "effect_started" | "confirmed" | "definitive_failed" | "ambiguous" | "cancelled" | "expired" | "blocked";
+export const ACTION_STATES = ["planned", "claimed_pre_effect", "effect_started", "confirmed", "definitive_failed", "ambiguous", "cancelled", "expired", "blocked"] as const;
+export type ActionState = typeof ACTION_STATES[number];
+export function isActionState(state: string): state is ActionState {
+  return ACTION_STATES.some((candidate) => candidate === state);
+}
 export interface ActionRecord extends ActionMaterial { readonly id: string; readonly workId: string; readonly semanticKey: string; readonly revision: number; readonly digest: string; readonly state: ActionState; readonly activeAttemptId?: string; readonly cancelledAt?: string; readonly cancelReason?: string; readonly createdAt: string; readonly updatedAt: string }
+export interface UnsupportedActionStateDiagnostic {
+  readonly kind: "unsupported_action_state";
+  readonly actionId: string;
+  readonly workId: string;
+  readonly state: string;
+  readonly revision: number;
+  readonly digest: string;
+}
+export interface ActionListResult {
+  readonly actions: ActionRecord[];
+  readonly unsupported: UnsupportedActionStateDiagnostic[];
+}
 
-export interface OwnerRuleMatcher { readonly effectClass: EffectClass; readonly recipient: string; readonly topic: string; readonly action: string }
-export interface SetOwnerRuleInput { readonly matcher: OwnerRuleMatcher; readonly provenance: EvidenceProvenance }
-export type OwnerRuleState = "enabled" | "revoked";
-export interface OwnerRuleRecord { readonly id: string; readonly revision: number; readonly state: OwnerRuleState; readonly matcher: OwnerRuleMatcher; readonly provenance: EvidenceProvenance; readonly createdAt: string; readonly updatedAt: string; readonly revokedAt?: string }
-
-export interface GrantExplicitApprovalInput { readonly actionId: string; readonly revision: number; readonly digest: string; readonly provenance: EvidenceProvenance }
-export type ExplicitApprovalState = "active" | "consumed" | "invalidated" | "revoked";
-export interface ExplicitApprovalRecord { readonly id: string; readonly actionId: string; readonly actionRevision: number; readonly actionDigest: string; readonly state: ExplicitApprovalState; readonly provenance: EvidenceProvenance; readonly createdAt: string; readonly updatedAt: string; readonly consumedAt?: string; readonly consumedAttemptId?: string; readonly invalidatedAt?: string; readonly revokedAt?: string }
-
-export type AuthorizationSource = "local_policy" | "owner_rule" | "owner_explicit";
 export type AttemptState = "claimed_pre_effect" | "effect_started" | "confirmed" | "definitive_failed" | "ambiguous" | "cancelled";
-export interface AttemptRecord { readonly id: string; readonly actionId: string; readonly actionRevision: number; readonly actionDigest: string; readonly sequence: number; readonly state: AttemptState; readonly workerId: string; readonly authorizationSource: AuthorizationSource; readonly authorizationId?: string; readonly authorizationRevision?: number; readonly claimedAt: string; readonly effectStartedAt?: string; readonly settledAt?: string; readonly outcome?: JsonValue; readonly recoveredAt?: string; readonly recoveryCount: number; readonly updatedAt: string }
+export interface AttemptRecord { readonly id: string; readonly actionId: string; readonly actionRevision: number; readonly actionDigest: string; readonly sequence: number; readonly state: AttemptState; readonly workerId: string; readonly claimedAt: string; readonly effectStartedAt?: string; readonly settledAt?: string; readonly outcome?: JsonValue; readonly recoveredAt?: string; readonly recoveryCount: number; readonly updatedAt: string }
 export interface ClaimForDispatchInput {
   readonly actionId: string;
   readonly revision: number;
@@ -64,7 +69,7 @@ export interface ClaimForDispatchInput {
   readonly attemptId: string;
   readonly workerId: string;
 }
-export type ClaimRejectionReason = "unknown_action" | "stale_revision" | "stale_digest" | "approval_required" | "blocked" | "cancelled" | "expired" | "already_claimed" | "effect_started" | "ambiguous" | "confirmed" | "terminal";
+export type ClaimRejectionReason = "unknown_action" | "stale_revision" | "stale_digest" | "blocked" | "cancelled" | "expired" | "already_claimed" | "effect_started" | "ambiguous" | "confirmed" | "terminal";
 export type ClaimForDispatchResult = { readonly kind: "claimed"; readonly resumed: boolean; readonly action: ActionRecord; readonly attempt: AttemptRecord } | { readonly kind: "rejected"; readonly reason: ClaimRejectionReason; readonly action?: ActionRecord; readonly attempt?: AttemptRecord };
 export interface AttemptTransitionInput { readonly attemptId: string; readonly workerId: string }
 export interface SettleAttemptInput extends AttemptTransitionInput { readonly outcome: JsonValue }
@@ -118,7 +123,6 @@ export interface FollowupDispatchRecord {
 
 export type FollowupDispatchOutcomeKind =
   | "confirmed"
-  | "approval_required"
   | "definitive_failed"
   | "ambiguous"
   | "rejected";
@@ -144,7 +148,6 @@ export type ClaimDueFollowupResult =
         | "disabled"
         | "not_due"
         | "cap_reached"
-        | "approval_required"
         | "policy_changed"
         | "expired"
         | "source_unconfirmed"
@@ -271,21 +274,10 @@ export type NotificationRecoveryResult =
   | ({ readonly kind: "reconcile_only" } & NotificationRouteTransition)
   | ({ readonly kind: "terminal" } & NotificationRouteTransition);
 
-export function authorizationRequirementForEffect(effectClass: EffectClass): AuthorizationRequirement {
-  switch (effectClass) {
-    case "ordinary_local_edit": case "ordinary_local_install": return "local_policy";
-    case "external_message": return "owner_rule_or_explicit";
-    case "delete_existing": case "bulk_existing_user_assets": case "core_setting_change": case "account_rights_change": case "cost_increase": case "external_mutation": return "owner_explicit";
-    case "uncovered": return "blocked";
-  }
-}
-export function ownerRuleCanAuthorize(effectClass: EffectClass): boolean { return effectClass === "external_message" }
 export function stableObservationId(source: string, occurrenceKey: string): string { return stableId("observation", source, occurrenceKey) }
 export function stableWorkId(workKey: string): string { return stableId("work", workKey) }
 export function stableActionId(workId: string, semanticKey: string): string { return stableId("action", workId, semanticKey) }
 export function stableRecontactId(actionId: string, revision: number, ordinal: number): string { return stableId("recontact", actionId, String(revision), String(ordinal)) }
-export function stableOwnerRuleId(matcher: OwnerRuleMatcher): string { return stableId("owner-rule", matcher.effectClass, matcher.recipient, matcher.topic, matcher.action) }
-export function stableExplicitApprovalId(actionId: string, revision: number, digest: string, evidenceId: string): string { return stableId("approval", actionId, String(revision), digest, evidenceId) }
 export function stableAttemptId(actionId: string, revision: number, dispatchKey: string): string { return stableId("attempt", actionId, String(revision), dispatchKey) }
 
 export function actionMaterialDigest(material: ActionMaterial): string {

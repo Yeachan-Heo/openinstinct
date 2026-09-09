@@ -110,8 +110,8 @@ export class LocalEffectPreflightError extends Error {
  * the actual paths and derives the effect class. A model-supplied class is
  * never accepted as input.
  *
- * This is a cooperative managed-effect gate. It does not sandbox shell
- * commands, browser code, packages, or unrelated processes.
+ * This optional managed executor verifies regular-file changes and records results.
+ * Native runtime tools remain available for other filesystem operations.
  */
 export async function preflightLocalFileAction(
   input: PreflightLocalFileActionInput,

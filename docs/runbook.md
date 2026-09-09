@@ -40,6 +40,13 @@ notices go to `daemon.ndjson` instead of the owner's inbox.
 
 ## First installation and permissions
 
+Full Disk Access for `~/.openinstinct/bin/openinstinctd` is the baseline OS
+capability for every installation, including Chat-only use. Enable it once in
+System Settings → Privacy & Security → Full Disk Access. OpenInstinct checks
+actual access and reports missing access without blocking otherwise-ready Chat;
+it cannot grant macOS TCC permissions to itself. Optional iMessage setup is a
+separate branch. Runtime tools do not require per-action application confirmation.
+
 ### End-user installation
 
 1. `curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/openinstinct/main/scripts/install-remote.sh | sh`

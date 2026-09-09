@@ -1,6 +1,5 @@
 import { join } from "node:path";
 import type { CustomTool } from "@gajae-code/coding-agent";
-import type { AssistantWorkRepository } from "../../store/assistant-work.ts";
 
 import type { ChildConversation, ChildTurnResult, ConversationalChildRunner } from "../conversation.ts";
 import { SdkChildSessionFactory, type ChildAgentSession, type ChildSessionFactory } from "./sdk-inprocess.ts";
@@ -16,8 +15,6 @@ export interface SdkConversationRunnerOptions {
   readonly interimRatePerMinute?: number;
   /** Managed tools available to ordinary conversational children. */
   readonly customTools?: readonly CustomTool[];
-  /** Production-only durable authority/effect ledger for the raw tool gate. */
-  readonly assistantWorkRepository?: AssistantWorkRepository;
 }
 
 /** Long-lived SDK adapter used only by delegate_background children. */
@@ -29,7 +26,7 @@ export class SdkConversationRunner implements ConversationalChildRunner {
     if (!options.factory && !options.modelPattern) {
       throw new Error("SdkConversationRunner needs modelPattern when using the production SDK factory");
     }
-    this.factory = options.factory ?? new SdkChildSessionFactory(options.modelPattern!, options.assistantWorkRepository);
+    this.factory = options.factory ?? new SdkChildSessionFactory(options.modelPattern!);
   }
 
   public async open(

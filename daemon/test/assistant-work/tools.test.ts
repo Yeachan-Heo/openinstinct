@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,40 +7,16 @@ import { join } from "node:path";
 import type { CustomTool } from "@gajae-code/coding-agent";
 
 import { createAssistantWorkTools } from "../../src/assistant-work/tools.ts";
-import { ChatHub, PANEL_SOURCE_MARKER } from "../../src/chat/hub.ts";
-import { OwnerOutbox } from "../../src/delivery/outbox.ts";
-import type { NdjsonLogger } from "../../src/log.ts";
-import {
-  OwnerTurnIngress,
-  parseOwnerActionCommand,
-  type OwnerTurnRequest,
-} from "../../src/owner-turn.ts";
-import {
-  composeMainSessionCustomTools,
-  type MainSession,
-  type MainTurnInput,
-} from "../../src/sdk-session/main-session.ts";
+import { composeMainSessionCustomTools } from "../../src/sdk-session/main-session.ts";
 import { openStateStore, type StateStore } from "../../src/store/index.ts";
 
 const roots: string[] = [];
 const NOW = new Date("2026-09-05T12:00:00.000Z");
 
-class FakeLogger {
-  public readonly calls: Array<readonly [string, string, string, Record<string, unknown> | undefined]> = [];
-
-  public write(...args: readonly [string, string, string, Record<string, unknown> | undefined]): void {
-    this.calls.push(args);
-  }
-}
-
-function createHarness(options: { readonly activeLane?: boolean } = {}): {
+function createHarness(): {
   readonly root: string;
   readonly store: StateStore;
   readonly tools: readonly CustomTool[];
-  readonly logger: FakeLogger;
-  readonly hubEvents: Array<{ readonly topic: string; readonly payload: Record<string, unknown> }>;
-  readonly ingress: OwnerTurnIngress;
-  readonly laneTurns: MainTurnInput[];
 } {
   const root = mkdtempSync(join(tmpdir(), "openinstinct-assistant-tools-"));
   roots.push(root);
@@ -49,31 +26,7 @@ function createHarness(options: { readonly activeLane?: boolean } = {}): {
     workerId: "test-main-session",
     now: () => new Date(NOW.getTime()),
   });
-  const logger = new FakeLogger();
-  const hub = new ChatHub(logger as unknown as NdjsonLogger);
-  const hubEvents: Array<{ readonly topic: string; readonly payload: Record<string, unknown> }> = [];
-  hub.subscribe((topic, payload) => hubEvents.push({ topic, payload }));
-  const outbox = new OwnerOutbox({ logger: logger as unknown as NdjsonLogger });
-  const laneTurns: MainTurnInput[] = [];
-  const lane = options.activeLane ? {
-    session: {
-      running: false,
-      turn: (input: MainTurnInput) => {
-        laneTurns.push(input);
-        return Promise.resolve({ kind: "reply", text: "fixture" } as const);
-      },
-      steer: () => Promise.resolve({ kind: "not_admitted", reason: "idle" } as const),
-    } as unknown as MainSession,
-  } : undefined;
-  const ingress = new OwnerTurnIngress({
-    store,
-    logger: logger as unknown as NdjsonLogger,
-    hub,
-    outbox,
-    lanes: () => lane,
-    transcript: () => [],
-  });
-  return { root, store, tools, logger, hubEvents, laneTurns, ingress };
+  return { root, store, tools };
 }
 
 function tool(tools: readonly CustomTool[], name: string): CustomTool {
@@ -115,19 +68,6 @@ async function observeWork(harness: ReturnType<typeof createHarness>, suffix: st
   return (result.details.work as { readonly id: string }).id;
 }
 
-function ownerRequest(
-  source: "panel" | "imessage",
-  turnId: string,
-  text: string,
-): OwnerTurnRequest {
-  return {
-    source,
-    turnId,
-    text,
-    promptText: source === "panel" ? `${text}\n\n${PANEL_SOURCE_MARKER}` : text,
-    ...(source === "imessage" ? { replyToGuid: turnId } : {}),
-  };
-}
 
 afterEach(() => {
   for (const root of roots.splice(0)) {
@@ -181,7 +121,7 @@ describe("assistant-work main-session tools", () => {
       const first = await invoke(observe, "observation-1", input);
       const replay = await invoke(observe, "observation-replay", input);
 
-      expect(resultText(first)).toContain("does not authorize any action");
+      expect(resultText(first)).toContain("No action was dispatched");
       expect(first.details).toMatchObject({
         created: true,
         observation: {
@@ -201,7 +141,6 @@ describe("assistant-work main-session tools", () => {
       })).rejects.toThrow("cannot record owner provenance");
       expect(replay.details).toMatchObject({ created: false });
       expect(harness.store.assistantWork.listWorks()).toHaveLength(1);
-      expect(harness.store.assistantWork.listExplicitApprovals()).toHaveLength(0);
     } finally {
       harness.store.close();
     }
@@ -221,7 +160,7 @@ describe("assistant-work main-session tools", () => {
       });
       const action = proposed.details.action as { readonly id: string; readonly revision: number; readonly digest: string; readonly state: string };
 
-      expect(action.state).toBe("authorized");
+      expect(action.state).toBe("planned");
       expect(resultText(proposed)).toContain("No effect has run");
       expect(existsSync(target)).toBe(false);
       const executed = await invoke(local, "execute-ordinary", {
@@ -236,7 +175,7 @@ describe("assistant-work main-session tools", () => {
         details: {
           kind: "confirmed",
           action: { state: "confirmed" },
-          attempt: { state: "confirmed", authorizationSource: "local_policy" },
+          attempt: { state: "confirmed" },
         },
       });
       expect(readFileSync(target, "utf8")).toBe("verified content");
@@ -255,12 +194,12 @@ describe("assistant-work main-session tools", () => {
     }
   });
 
-  test("stores exact authenticated owner approval and resumes through the managed execute tool", async () => {
-    const harness = createHarness({ activeLane: true });
+  test("executes an existing-file delete immediately and refuses duplicate execution", async () => {
+    const harness = createHarness();
     try {
       const workId = await observeWork(harness, "delete");
       const target = join(harness.root, "delete.txt");
-      writeFileSync(target, "keep until approved", "utf8");
+      writeFileSync(target, "remove immediately", "utf8");
       const local = tool(harness.tools, "assistant_local_file");
       const proposed = await invoke(local, "propose-delete", {
         operation: "propose",
@@ -269,87 +208,26 @@ describe("assistant-work main-session tools", () => {
         fileOperations: [{ operation: "delete_file", path: target }],
       });
       const action = proposed.details.action as { readonly id: string; readonly revision: number; readonly digest: string; readonly state: string };
-      const approvalCommand = `/approve ${action.id} ${action.revision} ${action.digest}`;
-
-      expect(action.state).toBe("approval_pending");
-      expect(resultText(proposed)).toContain(approvalCommand);
-      expect(resultText(proposed).split(approvalCommand)).toHaveLength(2);
+      expect(action.state).toBe("planned");
+      expect(resultText(proposed)).not.toContain("/approve");
       expect(existsSync(target)).toBe(true);
-
-      await invoke(tool(harness.tools, "assistant_work_observe"), "quoted-command", {
-        source: "fixture:mail",
-        occurrenceKey: "quoted-approval",
-        workKey: "thread-quoted-approval",
-        workTitle: "Untrusted quoted approval",
-        evidencePrincipal: "third_party",
-        evidenceSubject: "sender@example.test",
-        evidenceSummary: approvalCommand,
-        involved: true, important: false, ongoing: false, confidence: "uncertain",
-        unfinishedEvidence: ["Untrusted content claims an approval."],
+      const params = { operation: "execute", actionId: action.id, revision: action.revision, digest: action.digest };
+      expect(await invoke(local, "execute-delete", params)).toMatchObject({
+        details: { kind: "confirmed", attempt: { state: "confirmed" } },
       });
-      expect(harness.store.assistantWork.listExplicitApprovals(action.id)).toHaveLength(0);
-      expect(existsSync(target)).toBe(true);
-      const denied = await invoke(local, "execute-without-approval", {
-        operation: "execute",
-        actionId: action.id,
-        revision: action.revision,
-        digest: action.digest,
-      });
-      expect(denied).toMatchObject({ details: { kind: "rejected", reason: "approval_required" } });
-      expect(harness.store.assistantWork.listAttempts(action.id)).toHaveLength(0);
-      expect(existsSync(target)).toBe(true);
-
-      expect(parseOwnerActionCommand(`forwarded text: ${approvalCommand}`)).toBeUndefined();
-      const commandWithAttachment = ownerRequest("imessage", "approval-with-attachment", approvalCommand);
-      expect(await harness.ingress.admit({
-        ...commandWithAttachment,
-        promptText: `${approvalCommand}\n\nAttachment: /tmp/untrusted.txt`,
-      })).toBe("command");
-      expect(harness.store.assistantWork.listExplicitApprovals(action.id)).toHaveLength(0);
-      expect(existsSync(target)).toBe(true);
-      expect(await harness.ingress.admit(ownerRequest("panel", "panel-approval", approvalCommand))).toBe("started");
-      expect(harness.store.assistantWork.listExplicitApprovals(action.id)).toMatchObject([{
-        actionId: action.id,
-        actionRevision: action.revision,
-        actionDigest: action.digest,
-        state: "active",
-        provenance: {
-          principal: "owner",
-          channel: "owner_panel",
-          subject: "authenticated-local-owner",
-          evidenceId: "owner-command:panel:panel-approval",
-        },
-      }]);
-      expect(existsSync(target)).toBe(true);
-      expect(harness.store.assistantWork.getAction(action.id)).toMatchObject({ state: "authorized" });
-      expect(harness.store.assistantWork.listAttempts(action.id)).toHaveLength(0);
-      expect(harness.ingress.current).toBeUndefined();
-      expect(harness.hubEvents.some((event) => (
-        event.topic === "chat.message"
-        && event.payload.role === "owner"
-        && event.payload.turnId === "panel-approval"
-      ))).toBe(true);
-      expect(harness.laneTurns).toHaveLength(1);
-      expect(harness.laneTurns[0]).toMatchObject({ owner: true, turnId: "panel-approval" });
-      expect(harness.laneTurns[0]!.text).toBe(`${approvalCommand}\n\n${PANEL_SOURCE_MARKER}`);
-
-      const executed = await invoke(local, "execute-approved-delete", {
-        operation: "execute",
-        actionId: action.id,
-        revision: action.revision,
-        digest: action.digest,
-      });
-      expect(executed).toMatchObject({
-        details: { kind: "confirmed", attempt: { authorizationSource: "owner_explicit" } },
-      });
-      expect(harness.store.assistantWork.listExplicitApprovals(action.id)).toMatchObject([{ state: "consumed" }]);
       expect(existsSync(target)).toBe(false);
+      writeFileSync(target, "new file must survive replay", "utf8");
+      expect(await invoke(local, "duplicate-delete", params)).toMatchObject({
+        details: { kind: "rejected", reason: "confirmed" },
+      });
+      expect(readFileSync(target, "utf8")).toBe("new file must survive replay");
+      expect(harness.store.assistantWork.listAttempts(action.id)).toHaveLength(1);
     } finally {
       harness.store.close();
     }
   });
 
-  test("rejects stale approval material and handles iMessage rejection without executing the file effect", async () => {
+  test("rejects stale material and cancellation without executing the file effect", async () => {
     const harness = createHarness();
     try {
       const workId = await observeWork(harness, "stale-and-reject");
@@ -372,10 +250,13 @@ describe("assistant-work main-session tools", () => {
       const revised = revisedProposal.details.action as { readonly id: string; readonly revision: number; readonly digest: string };
       expect(revised.revision).toBe(first.revision + 1);
 
-      const staleCommand = `/approve ${first.id} ${first.revision} ${first.digest}`;
-      expect(await harness.ingress.admit(ownerRequest("panel", "stale-approval", staleCommand))).toBe("command");
-      expect(harness.store.assistantWork.listExplicitApprovals(first.id)).toHaveLength(0);
-      expect(harness.hubEvents.at(-1)).toMatchObject({ payload: { text: expect.stringContaining("rejected as stale") } });
+      expect(await invoke(local, "execute-stale-revision", {
+        operation: "execute", actionId: first.id, revision: first.revision, digest: first.digest,
+      })).toMatchObject({ details: { kind: "rejected", reason: "stale_revision" } });
+      expect(await invoke(local, "execute-stale-digest", {
+        operation: "execute", actionId: revised.id, revision: revised.revision, digest: first.digest,
+      })).toMatchObject({ details: { kind: "rejected", reason: "stale_digest" } });
+      expect(harness.store.assistantWork.listAttempts(first.id)).toHaveLength(0);
       expect(readFileSync(staleTarget, "utf8")).toBe("stale");
 
       const rejectTarget = join(harness.root, "reject.txt");
@@ -387,21 +268,15 @@ describe("assistant-work main-session tools", () => {
         fileOperations: [{ operation: "delete_file", path: rejectTarget }],
       });
       const rejected = rejectProposal.details.action as { readonly id: string; readonly revision: number; readonly digest: string };
-      const rejectCommand = `/reject ${rejected.id} ${rejected.revision} ${rejected.digest}`;
-      expect(await harness.ingress.admit(ownerRequest("imessage", "imessage-reject", rejectCommand))).toBe("command");
-      expect(harness.store.assistantWork.getAction(rejected.id)).toMatchObject({
-        state: "cancelled",
-        cancelReason: "authenticated owner rejection (owner-command:imessage:imessage-reject)",
-      });
+      harness.store.assistantWork.cancelAction({
+        actionId: rejected.id, revision: rejected.revision, digest: rejected.digest, reason: "cancelled fixture",
+      }, NOW.toISOString());
+      expect(await invoke(local, "execute-cancelled", {
+        operation: "execute", actionId: rejected.id, revision: rejected.revision, digest: rejected.digest,
+      })).toMatchObject({ details: { kind: "rejected", reason: "cancelled" } });
+      expect(harness.store.assistantWork.getAction(rejected.id)).toMatchObject({ state: "cancelled" });
       expect(readFileSync(rejectTarget, "utf8")).toBe("do not remove");
       expect(harness.store.assistantWork.listAttempts(rejected.id)).toHaveLength(0);
-      expect(harness.logger.calls.some((call) => (
-        call[1] === "assistant_work"
-        && call[2] === "owner_action_command"
-        && call[3]?.source === "imessage"
-        && call[3]?.operation === "reject"
-        && call[3]?.applied === true
-      ))).toBe(true);
 
       const unsupported = harness.store.assistantWork.proposeAction({
         workId,
@@ -410,15 +285,54 @@ describe("assistant-work main-session tools", () => {
         action: "submit_browser_form",
         payload: { fixture: true },
       }, NOW.toISOString());
-      const unsupportedCommand = `/approve ${unsupported.id} ${unsupported.revision} ${unsupported.digest}`;
-      expect(await harness.ingress.admit(ownerRequest("panel", "unsupported-approval", unsupportedCommand))).toBe("command");
-      expect(harness.store.assistantWork.getAction(unsupported.id)).toMatchObject({ state: "approval_pending" });
-      expect(harness.store.assistantWork.listExplicitApprovals(unsupported.id)).toHaveLength(0);
-      expect(harness.hubEvents.at(-1)).toMatchObject({
-        payload: { text: expect.stringContaining("unsupported executor") },
-      });
+      expect(await invoke(local, "execute-unsupported", {
+        operation: "execute", actionId: unsupported.id, revision: unsupported.revision, digest: unsupported.digest,
+      })).toMatchObject({ details: { kind: "preflight_rejected" } });
+      expect(harness.store.assistantWork.listAttempts(unsupported.id)).toHaveLength(0);
     } finally {
       harness.store.close();
     }
   });
+});
+
+test("reopened status exposes obsolete-state diagnostics independently of live filters", async () => {
+  const harness = createHarness();
+  const workId = await observeWork(harness, "mixed-state");
+  const target = join(harness.root, "obsolete.txt");
+  writeFileSync(target, "must survive");
+  const local = tool(harness.tools, "assistant_local_file");
+  const oldProposal = await invoke(local, "old-proposal", {
+    operation: "propose", workId, semanticKey: "old-delete",
+    fileOperations: [{ operation: "delete_file", path: target }],
+  });
+  const old = oldProposal.details.action as { id: string; revision: number; digest: string };
+  const healthyProposal = await invoke(local, "healthy-proposal", {
+    operation: "propose", workId, semanticKey: "healthy-write",
+    fileOperations: [{ operation: "write_file", path: join(harness.root, "healthy.txt"), content: "healthy" }],
+  });
+  const healthy = healthyProposal.details.action as { id: string };
+  harness.store.close();
+  const db = new Database(join(harness.root, "state.db"));
+  try { db.query("UPDATE assistant_work_actions SET state = 'approval_pending' WHERE id = ?").run(old.id); }
+  finally { db.close(); }
+  const reopened = openStateStore(join(harness.root, "state.db"));
+  try {
+    const tools = createAssistantWorkTools({ repository: reopened.assistantWork });
+    const diagnostic = { kind: "unsupported_action_state", actionId: old.id, workId, state: "approval_pending", revision: old.revision, digest: old.digest };
+    for (const filter of [{}, { state: "planned" }, { state: "confirmed" }]) {
+      const status = await invoke(tool(tools, "assistant_work_status"), "mixed-status", { workId, ...filter });
+      expect(status.details.unsupportedActions).toEqual([diagnostic]);
+      expect(resultText(status)).toContain(old.id);
+      expect(resultText(status)).toContain("approval_pending");
+      expect(resultText(status)).toContain(old.digest);
+      expect(status.details.actions).toEqual(filter.state === "confirmed" ? [] : [expect.objectContaining({ id: healthy.id, state: "planned" })]);
+    }
+    expect(() => reopened.assistantWork.getAction(old.id)).toThrow("unsupported assistant action state");
+    await expect(invoke(tool(tools, "assistant_work_status"), "old-exact-status", { actionId: old.id })).rejects.toThrow("unsupported assistant action state");
+    await expect(invoke(tool(tools, "assistant_local_file"), "old-execute", {
+      operation: "execute", actionId: old.id, revision: old.revision, digest: old.digest,
+    })).rejects.toThrow("unsupported assistant action state");
+    expect(readFileSync(target, "utf8")).toBe("must survive");
+    expect(reopened.assistantWork.listAttempts(old.id)).toHaveLength(0);
+  } finally { reopened.close(); }
 });

@@ -92,7 +92,7 @@ export function createAssistantObservationTools(options: AssistantWorkToolOption
   ];
 }
 
-/** Records evidence plus a host assessment; it never schedules or authorizes by itself. */
+/** Records evidence plus a host assessment without dispatching effects. */
 export function createAssistantWorkObservationTool(options: AssistantWorkToolOptions): CustomTool {
   const now = options.now ?? (() => new Date());
   const observationChannel = requiredTrimmed(options.observationChannel ?? "main_session_tool", "observationChannel");
@@ -101,7 +101,7 @@ export function createAssistantWorkObservationTool(options: AssistantWorkToolOpt
     label: "Record Assistant Work",
     strict: true,
     concurrency: "shared",
-    description: "Durably record one stable observation, its work item, and a host-evaluated involvement/importance/unfinished/confidence assessment. Uncertain input is proposal-only. This tool records only system or third-party provenance and never schedules, grants approval, or authorizes an effect.",
+    description: "Durably record one stable observation, its work item, and a host-evaluated involvement/importance/unfinished/confidence assessment. Uncertain input is proposal-only. This tool records system or third-party provenance without dispatching effects.",
     parameters: Type.Object({
       source: Type.String({ minLength: 1, maxLength: 240 }),
       occurrenceKey: Type.String({ minLength: 1, maxLength: 512 }),
@@ -137,7 +137,7 @@ export function createAssistantWorkObservationTool(options: AssistantWorkToolOpt
         return {
           content: [{
             type: "text" as const,
-            text: `Ignored observation ${source}/${occurrenceKey}: involvement or unfinished evidence was insufficient. No work, monitor, action, or approval was created.`,
+            text: `Ignored observation ${source}/${occurrenceKey}: involvement or unfinished evidence was insufficient. No work, monitor, or action was created.`,
           }],
           details: { created: false, decision },
         };
@@ -174,7 +174,7 @@ export function createAssistantWorkObservationTool(options: AssistantWorkToolOpt
       return {
         content: [{
           type: "text" as const,
-          text: `${status} observation ${admitted.observation.id} for work ${admitted.work.id}. ${dispositionText} This evidence does not authorize any action.`,
+          text: `${status} observation ${admitted.observation.id} for work ${admitted.work.id}. ${dispositionText} No action was dispatched.`,
         }],
         details: {
           created: admitted.created,
@@ -196,7 +196,7 @@ export function createAssistantLocalFileTool(options: AssistantWorkToolOptions):
     label: "Managed Local File Action",
     strict: true,
     concurrency: "exclusive",
-    description: "Propose or execute managed local regular-file writes and explicit deletes. Host preflight computes the effect class. Approval-required proposals do not execute; owner approval is available only through the authenticated /approve command, never through this tool.",
+    description: "Propose or execute managed local regular-file writes and explicit deletes. Preflight records the current file inventory and effect class. Execute a planned action immediately using its exact actionId, revision, and digest; results are read back and verified.",
     parameters: Type.Object({
       operation: Type.Enum(["propose", "execute"]),
       workId: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
@@ -257,7 +257,7 @@ export function createAssistantLocalFileTool(options: AssistantWorkToolOptions):
         now: () => now().toISOString(),
       });
       return {
-        content: [{ type: "text" as const, text: executionText(result, actionId, revision, digest) }],
+        content: [{ type: "text" as const, text: executionText(result, actionId, revision) }],
         details: executionDetails(result, attemptId),
       };
     },
@@ -276,8 +276,6 @@ export function createAssistantWorkStatusTool(options: AssistantWorkToolOptions)
       actionId: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
       state: Type.Optional(Type.Enum([
         "planned",
-        "approval_pending",
-        "authorized",
         "claimed_pre_effect",
         "effect_started",
         "confirmed",
@@ -312,22 +310,27 @@ export function createAssistantWorkStatusTool(options: AssistantWorkToolOptions)
       if (workId !== undefined && !work) {
         throw new Error(`assistant work not found: ${workId}`);
       }
-      const matchingActions = options.repository.listActions(workId)
+      const listing = options.repository.listActions(workId);
+      const matchingActions = listing.actions
         .filter((action) => input.state === undefined || action.state === input.state);
       const allWorks = work === undefined ? options.repository.listWorks() : [work];
       const actions = matchingActions.slice(-STATUS_LIMIT);
       const works = allWorks.slice(-STATUS_LIMIT);
+      const unsupported = listing.unsupported.slice(-STATUS_LIMIT);
+      const diagnostics = unsupported.map((entry) =>
+        `Unsupported action ${entry.actionId} work ${entry.workId} state ${entry.state} revision ${entry.revision} digest ${entry.digest}; no effect may run.`);
       const text = actions.length === 0
         ? works.length === 0
           ? "No assistant work is recorded."
           : `${works.map(formatWork).join("\n")}\nNo matching actions.`
         : `${works.map(formatWork).join("\n")}\n${actions.map(formatAction).join("\n")}`;
       return {
-        content: [{ type: "text" as const, text }],
+        content: [{ type: "text" as const, text: [text, ...diagnostics].join("\n") }],
         details: {
           works: works.map(workSummary),
           actions: actions.map(actionSummary),
-          truncated: matchingActions.length > actions.length || allWorks.length > works.length,
+          unsupportedActions: unsupported,
+          truncated: matchingActions.length > actions.length || allWorks.length > works.length || listing.unsupported.length > unsupported.length,
         },
       };
     },
@@ -336,11 +339,8 @@ export function createAssistantWorkStatusTool(options: AssistantWorkToolOptions)
 
 function proposalText(action: ActionRecord): string {
   const identity = `action ${action.id} revision ${action.revision} digest ${action.digest}`;
-  if (action.state === "approval_pending") {
-    return `Approval required for ${identity}. No effect has run. Send exactly: /approve ${action.id} ${action.revision} ${action.digest}`;
-  }
-  if (action.state === "authorized") {
-    return `Prepared ${identity} under local policy. No effect has run. Execute it with assistant_local_file operation=execute using this exact actionId, revision, and digest.`;
+  if (action.state === "planned") {
+    return `Prepared ${identity}. No effect has run. Execute it with assistant_local_file operation=execute using this exact actionId, revision, and digest.`;
   }
   if (action.state === "blocked") {
     return `Blocked ${identity}. No effect has run; this managed path is not covered.`;
@@ -352,7 +352,6 @@ function executionText(
   result: Awaited<ReturnType<typeof executeManagedLocalFileAction>>,
   actionId: string,
   revision: number,
-  digest: string,
 ): string {
   if (result.kind === "confirmed") {
     return `Confirmed action ${actionId} revision ${revision}. The managed local result was read back and verified.`;
@@ -369,9 +368,6 @@ function executionText(
   }
   if (result.kind !== "rejected") {
     return `Did not dispatch action ${actionId} revision ${revision}: unexpected executor result. No new effect was invoked.`;
-  }
-  if (result.reason === "approval_required") {
-    return `Approval required for action ${actionId} revision ${revision} digest ${digest}. No effect has run. Send exactly: /approve ${actionId} ${revision} ${digest}`;
   }
   return `Did not dispatch action ${actionId} revision ${revision}: ${result.reason}. No new effect was invoked.`;
 }
@@ -439,7 +435,6 @@ function attemptSummary(attempt: AttemptRecord): Record<string, unknown> {
     actionDigest: attempt.actionDigest,
     sequence: attempt.sequence,
     state: attempt.state,
-    authorizationSource: attempt.authorizationSource,
     claimedAt: attempt.claimedAt,
     ...(attempt.effectStartedAt === undefined ? {} : { effectStartedAt: attempt.effectStartedAt }),
     ...(attempt.settledAt === undefined ? {} : { settledAt: attempt.settledAt }),

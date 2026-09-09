@@ -50,7 +50,6 @@ function setupMessage(
   suffix: string,
   options: {
     readonly confirmed?: boolean;
-    readonly ownerRule?: boolean;
     readonly deadlineAt?: string;
   } = {},
 ) {
@@ -74,12 +73,6 @@ function setupMessage(
     topic: `topic-${suffix}`,
     action: "send_follow_up",
   };
-  const rule = options.ownerRule === false
-    ? undefined
-    : store.assistantWork.setOwnerRule({
-      matcher,
-      provenance: { ...OWNER, evidenceId: `owner-rule-${suffix}` },
-    }, T0);
   const action = store.assistantWork.proposeAction({
     workId: work.id,
     semanticKey: "source-message",
@@ -89,14 +82,6 @@ function setupMessage(
   }, T0);
 
   if (options.confirmed !== false) {
-    if (!rule) {
-      store.assistantWork.grantExplicitApproval({
-        actionId: action.id,
-        revision: action.revision,
-        digest: action.digest,
-        provenance: { ...OWNER, evidenceId: `source-approval-${suffix}` },
-      }, T0);
-    }
     confirmAction(
       store.assistantWork,
       action,
@@ -107,7 +92,7 @@ function setupMessage(
     );
   }
 
-  return { work, action, rule };
+  return { work, action };
 }
 
 function setPolicy(
@@ -248,17 +233,10 @@ describe("review recovery boundary regressions", () => {
       expect(store.assistantWork.listPendingFollowupReports()).toHaveLength(1);
     } finally { store.close(); }
   });
-  test("F1 same worker revalidates revoked pre-effect authorization before invoking the executor", async () => {
+  test("F1 same worker resumes a pre-effect message without grants before invoking the executor", async () => {
     const store = openStateStore(stateDbPath());
     try {
-      const prepared = prepareClaimedFollowup(store, "f1-revoked");
-      if (!prepared.rule) throw new Error("expected an owner rule");
-      store.assistantWork.revokeOwnerRule(
-        prepared.rule.id,
-        prepared.rule.revision,
-        { ...OWNER, evidenceId: "f1-rule-revocation" },
-        T1,
-      );
+      const prepared = prepareClaimedFollowup(store, "f1-autonomous");
       const executor = managedConfirmedExecutor(store.assistantWork, () => T2);
       const service = new FollowupRecoveryService({
         repository: store.assistantWork,
@@ -269,23 +247,16 @@ describe("review recovery boundary regressions", () => {
 
       const result = await service.tick(prepared.work.id);
 
-      expect(executor.calls).toHaveLength(0);
+      expect(executor.calls).toHaveLength(1);
       expect(result).toMatchObject({
         kind: "dispatched",
-        dispatch: {
-          id: prepared.dispatch.id,
-          state: "completed",
-          outcome: { kind: "rejected", detail: { reason: "terminal" } },
-        },
-        result: { kind: "rejected", reason: "terminal" },
+        dispatch: { id: prepared.dispatch.id, state: "completed" },
+        result: { kind: "confirmed" },
       });
       expect(store.assistantWork.getAttempt(prepared.attemptId)).toMatchObject({
-        state: "cancelled",
-        outcome: { reason: "authorization_no_longer_current" },
+        state: "confirmed", recoveryCount: 1,
       });
-      expect(store.assistantWork.getAction(prepared.followupAction.id)).toMatchObject({
-        state: "approval_pending",
-      });
+      expect(store.assistantWork.listAttempts(prepared.followupAction.id)).toHaveLength(1);
     } finally {
       store.close();
     }
@@ -330,23 +301,11 @@ describe("review recovery boundary regressions", () => {
   test("F2 externally confirmed due follow-up completes and advances without resend", async () => {
     const store = openStateStore(stateDbPath());
     try {
-      const { work, action } = setupMessage(store, "f2-external", { ownerRule: false });
+      const { work, action } = setupMessage(store, "f2-external");
       setPolicy(store, work.id, action.id, 2);
-      const due = store.assistantWork.claimDueFollowup(work.id, "materializer", T1);
-      expect(due).toMatchObject({
-        kind: "none",
-        reason: "approval_required",
-        dispatch: { state: "due", ordinal: 1 },
-      });
-      if (due.kind !== "none" || !due.dispatch || !due.action) {
-        throw new Error("expected an approval-gated due follow-up");
-      }
-      store.assistantWork.grantExplicitApproval({
-        actionId: due.action.id,
-        revision: due.action.revision,
-        digest: due.action.digest,
-        provenance: { ...OWNER, evidenceId: "f2-followup-approval" },
-      }, T1);
+      const due = store.assistantWork.claimDueFollowup(work.id, FOLLOWUP_WORKER, T1);
+      expect(due).toMatchObject({ kind: "claimed", dispatch: { state: "claimed", ordinal: 1 } });
+      if (due.kind !== "claimed") throw new Error("expected an immediately claimable follow-up");
       const attemptId = stableAttemptId(due.action.id, due.action.revision, due.dispatch.id);
       confirmAction(
         store.assistantWork,

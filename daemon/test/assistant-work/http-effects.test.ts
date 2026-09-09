@@ -96,23 +96,6 @@ function admitWork(store: ReturnType<typeof openStateStore>, suffix: string) {
   }, T0).work;
 }
 
-function approve(
-  store: ReturnType<typeof openStateStore>,
-  action: ActionRecord,
-  suffix: string,
-): void {
-  store.assistantWork.grantExplicitApproval({
-    actionId: action.id,
-    revision: action.revision,
-    digest: action.digest,
-    provenance: {
-      principal: "owner",
-      channel: "test-owner",
-      subject: "authenticated-owner",
-      evidenceId: `approval-${suffix}`,
-    },
-  }, T1);
-}
 
 function mutationInput(
   workId: string,
@@ -269,7 +252,7 @@ describe("managed service-neutral HTTP effects", () => {
       });
       expect(known).toMatchObject({
         effectClass: "external_mutation",
-        action: { state: "approval_pending", action: MANAGED_HTTP_ACTION },
+        action: { state: "planned", action: MANAGED_HTTP_ACTION },
         plan: {
           method: "PUT",
           url: service.url("/services/known/items/42"),
@@ -277,11 +260,10 @@ describe("managed service-neutral HTTP effects", () => {
         },
       });
       expect(isManagedHttpActionRecord(known.action)).toBe(true);
-      approve(store, known.action, "known");
       await expect(execute(store, service, known.action, "known-dispatch")).resolves.toMatchObject({
         kind: "confirmed",
         action: { state: "confirmed" },
-        attempt: { state: "confirmed", authorizationSource: "owner_explicit", effectStartedAt: T2 },
+        attempt: { state: "confirmed", effectStartedAt: T2 },
         evidence: { code: "http_effect_verified", effectInvoked: true },
       });
 
@@ -298,7 +280,6 @@ describe("managed service-neutral HTTP effects", () => {
         endpointPolicy: policyFor(service),
         now: () => T0,
       });
-      approve(store, novel.action, "novel");
       await expect(execute(store, service, novel.action, "novel-dispatch")).resolves.toMatchObject({
         kind: "confirmed",
         evidence: { verification: { matched: true } },
@@ -313,7 +294,7 @@ describe("managed service-neutral HTTP effects", () => {
     }
   });
 
-  test("classifies every mutation host-side and binds an explicit message operation to an exact owner rule", async () => {
+  test("classifies mutations host-side and binds message operations to exact endpoint capabilities", async () => {
     const service = await fixture();
     const store = createStore();
     const work = admitWork(store, "message-rule");
@@ -323,15 +304,6 @@ describe("managed service-neutral HTTP effects", () => {
       action: "send_status_message",
     } as const;
     try {
-      store.assistantWork.setOwnerRule({
-        matcher: { effectClass: "external_message", ...messageOperation },
-        provenance: {
-          principal: "owner",
-          channel: "test-owner",
-          subject: "authenticated-owner",
-          evidenceId: "message-rule-fixture",
-        },
-      }, T0);
 
       const path = "/messages/status-thread-7";
       const proposed = await proposeManagedHttpAction(mutationInput(work.id, service, "message", {
@@ -358,7 +330,7 @@ describe("managed service-neutral HTTP effects", () => {
       expect(proposed).toMatchObject({
         effectClass: "external_message",
         action: {
-          state: "approval_pending",
+          state: "planned",
           effectClass: "external_message",
           recipient: messageOperation.recipient,
           topic: messageOperation.topic,
@@ -368,7 +340,7 @@ describe("managed service-neutral HTTP effects", () => {
       expect(isManagedHttpActionRecord(proposed.action)).toBe(true);
       await expect(execute(store, service, proposed.action, "owner-rule-message", { authorizeMessage: messageAccess(service).authorizeMessage })).resolves.toMatchObject({
         kind: "confirmed",
-        attempt: { authorizationSource: "owner_rule" },
+        attempt: { state: "confirmed" },
       });
       expect(proposed.plan.messageAuthorization).toEqual({ capabilityId: "fixture-status-message", capabilityVersion: 1 });
 
@@ -478,7 +450,6 @@ describe("managed service-neutral HTTP effects", () => {
         endpointPolicy: policyFor(service),
         now: () => T0,
       });
-      approve(store, proposed.action, "durable-start");
       const attemptId = stableAttemptId(proposed.action.id, proposed.action.revision, "durable-start-dispatch");
       const pending = executeManagedHttpAction({
         repository: store.assistantWork,
@@ -522,7 +493,6 @@ describe("managed service-neutral HTTP effects", () => {
         endpointPolicy: policyFor(service),
         now: () => T0,
       });
-      approve(store, proposed.action, "timeout");
       const attemptId = stableAttemptId(proposed.action.id, proposed.action.revision, "timeout-dispatch");
       const result = await executeManagedHttpAction({
         repository: store.assistantWork,
@@ -583,7 +553,6 @@ describe("managed service-neutral HTTP effects", () => {
         endpointPolicy: policyFor(service),
         now: () => T0,
       });
-      approve(store, proposed.action, "wrong-verification");
       const result = await execute(store, service, proposed.action, "wrong-verification-dispatch");
       expect(result).toMatchObject({
         kind: "ambiguous",
@@ -599,7 +568,7 @@ describe("managed service-neutral HTTP effects", () => {
     }
   });
 
-  test("invalidates stale digest approval material before dispatch", async () => {
+  test("rejects stale revision and digest material before executing the current action", async () => {
     const service = await fixture();
     const store = createStore();
     const work = admitWork(store, "stale-digest");
@@ -616,7 +585,6 @@ describe("managed service-neutral HTTP effects", () => {
         endpointPolicy: policyFor(service),
         now: () => T0,
       });
-      approve(store, first.action, "stale-first");
       const revised = await proposeManagedHttpAction(mutationInput(work.id, service, "stale-digest", {
         body: JSON.stringify({ status: "revised" }),
         verification: {
@@ -631,9 +599,8 @@ describe("managed service-neutral HTTP effects", () => {
       expect(revised.action).toMatchObject({
         id: first.action.id,
         revision: first.action.revision + 1,
-        state: "approval_pending",
+        state: "planned",
       });
-      expect(store.assistantWork.listExplicitApprovals(first.action.id)).toMatchObject([{ state: "invalidated" }]);
 
       const staleRevision = await executeManagedHttpAction({
         repository: store.assistantWork,
@@ -658,11 +625,13 @@ describe("managed service-neutral HTTP effects", () => {
         now: () => T2,
       });
       expect(staleDigest).toMatchObject({ kind: "rejected", reason: "stale_digest" });
-      await expect(execute(store, service, revised.action, "revised-without-approval")).resolves.toMatchObject({
-        kind: "rejected",
-        reason: "approval_required",
-      });
       expect(service.requestCount("PATCH", path)).toBe(0);
+      await expect(execute(store, service, revised.action, "revised-immediate")).resolves.toMatchObject({
+        kind: "confirmed",
+        attempt: { state: "confirmed" },
+      });
+      expect(service.requestCount("PATCH", path)).toBe(1);
+      expect(service.resource(path)).toMatchObject({ value: { status: "revised" } });
     } finally {
       store.close();
     }
@@ -688,7 +657,6 @@ describe("managed service-neutral HTTP effects", () => {
         endpointPolicy: policyFor(service),
         now: () => T0,
       });
-      approve(store, proposed.action, "redirect");
       const result = await execute(store, service, proposed.action, "redirect-dispatch");
       expect(result).toMatchObject({
         kind: "ambiguous",
@@ -733,7 +701,6 @@ describe("managed service-neutral HTTP effects", () => {
       expect(JSON.stringify(proposed.action)).not.toContain(token);
       expect(JSON.stringify(proposed.plan)).toContain("secret://fixture/service-token");
       expect(JSON.stringify(proposed.plan)).not.toContain(token);
-      approve(store, proposed.action, "secret-header");
       const result = await execute(store, service, proposed.action, "secret-header-dispatch", {
         resolveSecret: async (reference) => {
           expect(reference).toBe("secret://fixture/service-token");
@@ -802,7 +769,7 @@ describe("managed service-neutral HTTP effects", () => {
     }
   });
 
-  test("exposes one registration API for GET, proposal, and exact approved execution", async () => {
+  test("exposes one registration API for GET, proposal, and exact immediate execution", async () => {
     const service = await fixture();
     const store = createStore();
     const work = admitWork(store, "tool-api");
@@ -833,8 +800,7 @@ describe("managed service-neutral HTTP effects", () => {
         },
       });
       const action = proposal.details.action as ActionRecord;
-      expect(action).toMatchObject({ state: "approval_pending", effectClass: "external_mutation" });
-      approve(store, store.assistantWork.getAction(action.id)!, "tool-api");
+      expect(action).toMatchObject({ state: "planned", effectClass: "external_mutation" });
       currentTime = T2;
       const executed = await invoke(tool, "tool-execute", {
         operation: "execute",
@@ -843,7 +809,7 @@ describe("managed service-neutral HTTP effects", () => {
         digest: action.digest,
       });
       expect(executed).toMatchObject({
-        details: { operation: "execute", kind: "confirmed", attempt: { authorizationSource: "owner_explicit" } },
+        details: { operation: "execute", kind: "confirmed", attempt: { state: "confirmed" } },
       });
       expect(service.requestCount("DELETE", "/services/tool-mutation")).toBe(1);
     } finally {

@@ -59,7 +59,7 @@ function stateDbPath(): string {
 function setupConfirmedMessage(
   store: ReturnType<typeof openStateStore>,
   suffix: string,
-  options: { readonly rule?: boolean; readonly deadlineAt?: string } = { rule: true },
+  options: { readonly deadlineAt?: string } = {},
 ) {
   const work = store.assistantWork.admitObservation({
     source: "test:followup",
@@ -81,10 +81,6 @@ function setupConfirmedMessage(
     topic: `topic-${suffix}`,
     action: "send_follow_up",
   };
-  const rule = options.rule === false ? undefined : store.assistantWork.setOwnerRule({
-    matcher,
-    provenance: { ...OWNER, evidenceId: `owner-rule-${suffix}` },
-  }, T0);
   const action = store.assistantWork.proposeAction({
     workId: work.id,
     semanticKey: "original-message",
@@ -92,14 +88,6 @@ function setupConfirmedMessage(
     payload: { body: `Original ${suffix}` },
     ...(options.deadlineAt === undefined ? {} : { deadlineAt: options.deadlineAt }),
   }, T0);
-  if (!rule) {
-    store.assistantWork.grantExplicitApproval({
-      actionId: action.id,
-      revision: action.revision,
-      digest: action.digest,
-      provenance: { ...OWNER, evidenceId: `owner-approval-${suffix}` },
-    }, T0);
-  }
   const attemptId = stableAttemptId(action.id, action.revision, `original-${suffix}`);
   const claimed = store.assistantWork.claimForDispatch({
     actionId: action.id,
@@ -115,7 +103,7 @@ function setupConfirmedMessage(
     workerId: "original-worker",
     outcome: { confirmed: true },
   }, T0);
-  return { work, action, rule };
+  return { work, action };
 }
 
 function setPolicy(
@@ -194,7 +182,7 @@ describe("durable follow-up policy", () => {
           subject: "sender@example.test",
           evidenceId: "mail-policy-text",
         },
-      }, T0)).toThrow("third_party evidence cannot create owner authorization");
+      }, T0)).toThrow("third_party evidence cannot configure owner followups");
 
       const policy = setPolicy(store, work.id, action.id);
       expect(policy).toMatchObject({
@@ -318,9 +306,9 @@ describe("durable follow-up policy", () => {
     }
   });
 
-  test("a previous one-shot approval never authorizes the distinct follow-up action", async () => {
+  test("dispatches a distinct follow-up immediately under its scheduling policy", async () => {
     const store = openStateStore(stateDbPath());
-    const { work, action } = setupConfirmedMessage(store, "one-shot", { rule: false });
+    const { work, action } = setupConfirmedMessage(store, "immediate-followup");
     setPolicy(store, work.id, action.id, 1);
     const executor = confirmedExecutor(store.assistantWork);
     const reports = reportsCollector();
@@ -332,28 +320,20 @@ describe("durable follow-up policy", () => {
       authoredReport: reports.authoredReport,
     });
     try {
-      expect(await service.tick(work.id)).toEqual({ kind: "not_dispatched", reason: "approval_required" });
-      expect(executor.calls).toHaveLength(0);
-      expect(reports.reports).toContainEqual(expect.objectContaining({ code: "followup_approval_required" }));
-      const due = store.assistantWork.listFollowupDispatches(work.id);
-      expect(due).toMatchObject([{ state: "due", ordinal: 1 }]);
-      const followup = store.assistantWork.getAction(due[0]!.actionId);
-      if (!followup) throw new Error("approval-required follow-up action was not persisted");
-      expect(followup.state).toBe("approval_pending");
-
-      store.assistantWork.grantExplicitApproval({
-        actionId: followup.id,
-        revision: followup.revision,
-        digest: followup.digest,
-        provenance: { ...OWNER, evidenceId: "owner-followup-specific-approval" },
-      }, T1);
       expect(await service.tick(work.id)).toMatchObject({
         kind: "dispatched",
         dispatch: { ordinal: 1, state: "completed" },
-        result: { kind: "confirmed", attempt: { authorizationSource: "owner_explicit", state: "confirmed" } },
+        result: { kind: "confirmed", attempt: { state: "confirmed" } },
       });
       expect(executor.calls).toHaveLength(1);
-      expect(store.assistantWork.listExplicitApprovals(followup.id)).toMatchObject([{ state: "consumed" }]);
+      const dispatch = store.assistantWork.listFollowupDispatches(work.id)[0]!;
+      expect(dispatch.actionId).not.toBe(action.id);
+      expect(store.assistantWork.getAction(dispatch.actionId)).toMatchObject({ state: "confirmed" });
+      expect(store.assistantWork.listAttempts(dispatch.actionId)).toMatchObject([{
+        state: "confirmed", outcome: { confirmedActionId: dispatch.actionId },
+      }]);
+      expect(await service.tick(work.id)).toEqual({ kind: "not_dispatched", reason: "cap_reached" });
+      expect(executor.calls).toHaveLength(1);
     } finally {
       store.close();
     }
@@ -421,18 +401,12 @@ describe("follow-up dispatch races and recovery", () => {
     }
   });
 
-  test("revoked current rule prevents effect start after an ordinal was prepared", async () => {
+  test("dispatches a prepared ordinal without an intervening owner rule", async () => {
     const store = openStateStore(stateDbPath());
-    const { work, action, rule } = setupConfirmedMessage(store, "rule-revoked");
+    const { work, action } = setupConfirmedMessage(store, "prepared-immediate");
     setPolicy(store, work.id, action.id, 1);
     const prepared = store.assistantWork.claimDueFollowup(work.id, "recovery-worker", T1);
     expect(prepared).toMatchObject({ kind: "claimed", dispatch: { ordinal: 1 } });
-    store.assistantWork.revokeOwnerRule(
-      rule!.id,
-      rule!.revision,
-      { ...OWNER, evidenceId: "owner-revoked-rule" },
-      T1,
-    );
     const executor = confirmedExecutor(store.assistantWork);
     const reports = reportsCollector();
     const service = new FollowupRecoveryService({
@@ -444,12 +418,13 @@ describe("follow-up dispatch races and recovery", () => {
     });
     try {
       const result = await service.tick(work.id);
-      expect(result).toEqual({ kind: "not_dispatched", reason: "approval_required" });
-      expect(executor.calls).toHaveLength(0);
+      expect(result).toMatchObject({ kind: "dispatched", result: { kind: "confirmed" } });
+      expect(executor.calls).toHaveLength(1);
       const followup = store.assistantWork.listFollowupDispatches(work.id)[0];
-      expect(followup).toMatchObject({ state: "due" });
-      expect(store.assistantWork.listAttempts(followup!.actionId)).toHaveLength(0);
-      expect(reports.reports).toContainEqual(expect.objectContaining({ code: "followup_approval_required" }));
+      expect(followup).toMatchObject({ state: "completed" });
+      expect(store.assistantWork.listAttempts(followup!.actionId)).toMatchObject([{
+        state: "confirmed", outcome: { confirmedActionId: followup!.actionId },
+      }]);
     } finally {
       store.close();
     }
@@ -479,7 +454,6 @@ describe("follow-up dispatch races and recovery", () => {
             sequence: 1,
             state: "confirmed",
             workerId,
-            authorizationSource: "owner_rule",
             claimedAt: T1,
             effectStartedAt: T1,
             settledAt: T1,
@@ -496,7 +470,7 @@ describe("follow-up dispatch races and recovery", () => {
       expect(callbackCalls).toBe(1);
       const dispatch = store.assistantWork.listFollowupDispatches(work.id)[0];
       expect(dispatch).toMatchObject({ state: "claimed" });
-      expect(store.assistantWork.getAction(dispatch!.actionId)).toMatchObject({ state: "approval_pending" });
+      expect(store.assistantWork.getAction(dispatch!.actionId)).toMatchObject({ state: "planned" });
       expect(store.assistantWork.listAttempts(dispatch!.actionId)).toHaveLength(0);
     } finally {
       store.close();

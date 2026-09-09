@@ -7,8 +7,6 @@ import { createAgentSession, SessionManager, Settings, type CustomTool } from "@
 import { AgentRegistry } from "@gajae-code/coding-agent/registry/agent-registry";
 import { browserProfileEnforcer } from "../../browser/enforce.ts";
 import { createChildTabRegistry, type ChildTabRegistry } from "../../browser/child-tab.ts";
-import { createManagedToolGate } from "../../assistant-work/tool-gate.ts";
-import type { AssistantWorkRepository } from "../../store/assistant-work.ts";
 import { loadSoul } from "../../persona/soul.ts";
 import type { ChildRunRequest, ChildRunResult, ChildRunner } from "../runner.ts";
 import { CHILD_REPORTING_INSTRUCTION } from "../report-progress-tool.ts";
@@ -47,8 +45,6 @@ export interface SdkInProcessRunnerOptions {
   readonly modelPattern?: string;
   /** Main provides the exact managed or observation-only tools for this child lane. */
   readonly customTools?: readonly CustomTool[];
-  /** Production-only durable authority/effect ledger for the raw tool gate. */
-  readonly assistantWorkRepository?: AssistantWorkRepository;
   /** Shared per-task tab registry for the single browser window. */
   readonly tabs?: ChildTabRegistry;
 }
@@ -65,7 +61,7 @@ export class SdkInProcessRunner implements ChildRunner {
     if (!options.factory && !options.modelPattern) {
       throw new Error("SdkInProcessRunner needs modelPattern when using the production SDK factory");
     }
-    this.factory = options.factory ?? new SdkChildSessionFactory(options.modelPattern!, options.assistantWorkRepository, options.tabs);
+    this.factory = options.factory ?? new SdkChildSessionFactory(options.modelPattern!, options.tabs);
   }
 
   public async run(request: ChildRunRequest, signal: AbortSignal): Promise<ChildRunResult> {
@@ -140,13 +136,17 @@ export class SdkInProcessRunner implements ChildRunner {
   }
 }
 
+/** Keep each child on its own tab without restricting its runtime tools. */
+export function composeChildSessionExtensions(chromeProfile: string, tabPrefix: string, tabs: ChildTabRegistry) {
+  return [browserProfileEnforcer(chromeProfile, { tabPrefix, tabs })];
+}
+
 export class SdkChildSessionFactory implements ChildSessionFactory {
   public readonly agentRegistry = new AgentRegistry();
   private sessionSequence = 0;
 
   public constructor(
     private readonly modelPattern: string,
-    private readonly assistantWorkRepository?: AssistantWorkRepository,
     private readonly tabs: ChildTabRegistry = createChildTabRegistry(),
   ) {}
 
@@ -170,7 +170,6 @@ export class SdkChildSessionFactory implements ChildSessionFactory {
       ? SessionManager.create(input.workingDirectory, input.sessionDirectory)
       : await SessionManager.open(input.sessionFile);
     const customTools = input.customTools ?? [];
-    const managedLocalFileAvailable = customTools.some((tool) => tool.name === "assistant_local_file");
     const { session } = await createAgentSession({
       settings,
       agentRegistry: this.agentRegistry,
@@ -179,36 +178,19 @@ export class SdkChildSessionFactory implements ChildSessionFactory {
       agentRosterLabel: `child-${input.childId}`,
       // Discoverable-only meant the model had to find `browser` via search first;
       // in practice it concluded there was no browser and fell back to osascript.
-      discoverableToolAllowedNames: ["browser"],
       alwaysActiveToolNames: ["browser"],
       cwd: input.workingDirectory,
       sessionManager: manager,
       modelPattern: this.modelPattern,
       ...(customTools.length > 0 ? { customTools: [...customTools] } : {}),
       enableLsp: false,
-      // Children get a generous but finite budget: a monitor that needs 40 tool calls is doing something wrong.
-      extensions: [
-        browserProfileEnforcer(join(homedir(), ".openinstinct", "chrome-profile"), {
-          forbiddenRoot: join(homedir(), ".openinstinct"),
-          maxToolCallsPerTurn: 40,
-          tabPrefix,
-          tabs: this.tabs,
-        }),
-        ...(this.assistantWorkRepository === undefined
-          ? []
-          : [createManagedToolGate({
-            repository: this.assistantWorkRepository,
-            contextId: `child:${input.childId}`,
-            managedLocalFileAvailable,
-          })]),
-      ],
+      extensions: composeChildSessionExtensions(join(homedir(), ".openinstinct", "chrome-profile"), tabPrefix, this.tabs),
       systemPrompt: (defaults) => {
         const prompt = childSystemPrompt(
           defaults,
           input.conversational,
           tabPrefix,
           customTools.some((tool) => tool.name === "assistant_work_observe"),
-          managedLocalFileAvailable,
         );
         promptHash = hashPrompt(prompt);
         return prompt;
@@ -237,7 +219,6 @@ export function childSystemPrompt(
   conversational: boolean,
   tabPrefix?: string,
   observationTools = false,
-  managedLocalFileAvailable = false,
 ): string[] {
   const chromeProfile = join(homedir(), ".openinstinct", "chrome-profile");
   const browserInstruction = tabPrefix === undefined
@@ -248,11 +229,10 @@ export function childSystemPrompt(
     loadSoul().text,
     browserInstruction,
     ...(observationTools
-      ? ["These custom observation tools may persist system/third-party observations and cooperative read-only monitor plans only; they expose no owner-approval or managed-effect execution API. Browser/runtime read-only instructions are policy, not OS-level confinement."]
+      ? ["Use the observation tools to persist evidence and monitor plans. Carry out the assigned observation task without expanding it into unrelated actions; SDK runtime tools remain available directly."]
       : []),
-    ...(managedLocalFileAvailable
-      ? ["For regular-file changes, use assistant_local_file propose/execute instead of raw write/edit. Raw bash and mutating browser actions require exact authenticated-owner approval and remain ambiguous after execution until independently verified."]
-      : []),
+    "SDK runtime tools are available directly; custom managed tools are optional. Report actual tool results and verify effects before claiming success. Inspect uncertain outcomes before repeating an effect.",
+    "Keep work focused and report progress during lengthy tasks. Prefer bounded commands or asynchronous execution when useful for responsiveness; these are recommendations, not execution limits.",
     ...(conversational ? [CHILD_REPORTING_INSTRUCTION] : []),
     "Runtime context: you are Gajae running as a background worker inside OpenInstinct; the soul above is unchanged. Complete the assigned task independently and return a concise, factual result for the owner-facing Gajae session to relay. That result is texted to the owner over iMessage, so write it as plain text: no Markdown headings, bold, code fences, tables, or list syntax.",
   ];

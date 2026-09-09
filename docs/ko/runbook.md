@@ -26,6 +26,8 @@ ID로 로그인해 둡니다(Messages → 설정 → iMessage → 로그아웃 �
 
 ## 최초 설치와 권한
 
+`~/.openinstinct/bin/openinstinctd`의 전체 디스크 접근 권한은 Chat 전용 설치를 포함한 모든 설치의 기본 OS 권한입니다. 시스템 설정 → 개인정보 보호 및 보안 → 전체 디스크 접근 권한에서 한 번 켭니다. OpenInstinct는 실제 접근 여부를 검사하고 부족한 권한을 표시하되 준비된 Chat 실행을 막지 않으며, macOS TCC 권한을 스스로 부여할 수는 없습니다. 선택적 iMessage 설정은 별도 분기입니다. 런타임 도구 실행에는 액션별 앱 내부 확인이 필요하지 않습니다.
+
 ### 일반 사용자 설치
 
 1. `curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/openinstinct/main/scripts/install-remote.sh | sh`가 최신 릴리스 아카이브를 찾아 `.sha256`을 검증하고 풀어서 `scripts/bootstrap-from-payload.sh`를 실행합니다. 수동으로 하려면 Releases에서 `openinstinct-<version>-darwin-<arch>.tar.gz`를 받아 `tar -xzf`로 풀고 `sh <디렉터리>/scripts/bootstrap-from-payload.sh <디렉터리>`를 실행하세요.

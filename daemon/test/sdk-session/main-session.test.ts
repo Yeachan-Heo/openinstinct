@@ -8,6 +8,7 @@ import {
   MAIN_SESSION_ID_META,
   MainSession,
   createSendImageTool,
+  composeMainSessionExtensions,
   openMainSession,
   type MainAgentSession,
   type ActiveTurn,
@@ -23,6 +24,27 @@ afterEach(() => {
   for (const directory of directories.splice(0)) {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("main application extensions allow raw tools and retain browser profile routing", async () => {
+  const handlers: Array<(event: unknown) => unknown> = [];
+  for (const extension of composeMainSessionExtensions("/tmp/autonomous-profile")) {
+    await extension({
+      on: (name: string, handler: (event: unknown) => unknown) => {
+        if (name === "tool_call") handlers.push(handler);
+      },
+    } as never);
+  }
+  expect(handlers).toHaveLength(1);
+  for (const toolName of ["write", "edit", "bash", "browser", "unknown_plugin_tool"]) {
+    const input = toolName === "browser"
+      ? { action: "click", app: { browser: "chrome", user_data_dir: "/tmp/autonomous-profile", cdp_port: 9222 } }
+      : { path: "/tmp/autonomous-file", command: "touch /tmp/autonomous-file" };
+    for (const handler of handlers) {
+      expect(await handler({ type: "tool_call", toolCallId: toolName, toolName, input })).toBeUndefined();
+    }
+  }
+  expect(await handlers[0]!({ type: "tool_call", toolName: "browser", input: {} })).toMatchObject({ block: true });
 });
 
 class Deferred<T> {

@@ -63,14 +63,15 @@ describe("BootstrapMachine", () => {
       probes: {
         config: { status: "passed" },
         credentials: { status: "missing" },
+        fda: { status: "passed" },
       },
       reason: "credentials are required",
     });
-    expect(fdaCalls).toBe(0);
+    expect(fdaCalls).toBe(1);
     expect(accessibilityCalls).toBe(0);
   });
 
-  test("runs without an owner handle and skips iMessage probes", async () => {
+  test("checks baseline FDA without an owner handle and skips iMessage probes", async () => {
     let fdaCalls = 0;
     let accessibilityCalls = 0;
     const machine = new BootstrapMachine(probesFor(
@@ -92,9 +93,9 @@ describe("BootstrapMachine", () => {
       probes: { config: { status: "passed" }, credentials: { status: "passed" } },
     });
     expect(snapshot.imessageHandle).toBeUndefined();
-    expect(snapshot.probes.fda).toBeUndefined();
+    expect(snapshot.probes.fda).toEqual({ status: "passed" });
     expect(snapshot.probes.accessibility).toBeUndefined();
-    expect(fdaCalls).toBe(0);
+    expect(fdaCalls).toBe(1);
     expect(accessibilityCalls).toBe(0);
   });
 
@@ -111,6 +112,7 @@ describe("BootstrapMachine", () => {
       state: "running",
       imessageHandle: "+821012345678",
       probes: { fda: { status: "denied" } },
+      reason: expect.stringContaining("OS capabilities are limited"),
     });
   });
 
@@ -138,8 +140,42 @@ describe("BootstrapMachine", () => {
       state: "running",
       reason: "config.json is not valid JSON",
     });
-    expect(fdaCalls).toBe(0);
+    expect(fdaCalls).toBe(2);
     expect(accessibilityCalls).toBe(0);
+  });
+
+  for (const status of ["denied", "unknown", "error"] as const) {
+    test(`chat-only runtime keeps running with truthful ${status} FDA diagnostics`, async () => {
+      const machine = new BootstrapMachine(probesFor(
+        configProbe("passed"),
+        probe("passed"),
+        async () => probe(status),
+      ));
+      await expect(machine.evaluate()).resolves.toMatchObject({
+        state: "running",
+        probes: { fda: { status } },
+        reason: expect.stringContaining(`not verified (${status})`),
+      });
+    });
+  }
+
+  test("a failed FDA recheck replaces prior success without stopping Chat", async () => {
+    let fail = false;
+    const machine = new BootstrapMachine(probesFor(
+      configProbe("passed"),
+      probe("passed"),
+      async () => {
+        if (fail) throw new Error("access probe unavailable");
+        return probe("passed");
+      },
+    ));
+    expect((await machine.evaluate()).probes.fda?.status).toBe("passed");
+    fail = true;
+    await expect(machine.evaluate()).resolves.toMatchObject({
+      state: "running",
+      probes: { fda: { status: "error", reason: "access probe unavailable" } },
+      reason: expect.stringContaining("not verified (error)"),
+    });
   });
 
   test("records a degraded state when a probe throws", async () => {

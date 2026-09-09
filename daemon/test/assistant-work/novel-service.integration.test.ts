@@ -7,12 +7,7 @@ import type { CustomTool } from "@gajae-code/coding-agent";
 
 import { createManagedHttpTool } from "../../src/assistant-work/http-effects.ts";
 import { configuredHttpAccess } from "../../src/assistant-work/http-policy.ts";
-import { ChatHub, PANEL_SOURCE_MARKER } from "../../src/chat/hub.ts";
-import { OwnerOutbox } from "../../src/delivery/outbox.ts";
-import { NdjsonLogger } from "../../src/log.ts";
-import { OwnerTurnIngress, type OwnerTurnRequest } from "../../src/owner-turn.ts";
 import type { ActionRecord, JsonValue } from "../../src/assistant-work/model.ts";
-import type { MainSession, MainTurnInput } from "../../src/sdk-session/main-session.ts";
 import { openStateStore, type StateStore } from "../../src/store/index.ts";
 import {
   HttpServiceFixture,
@@ -24,7 +19,6 @@ const fixtures: HttpServiceFixture[] = [];
 interface NovelHarness {
   readonly store: StateStore;
   readonly tool: CustomTool;
-  readonly ingress: OwnerTurnIngress;
 }
 
 interface DiscoveredContract {
@@ -71,39 +65,13 @@ function createHarness(service: HttpServiceFixture): NovelHarness {
     ...access,
     workerId: "novel-service-integration",
   });
-  const logger = new NdjsonLogger(join(root, "novel-service.ndjson"));
-  const hub = new ChatHub(logger);
-  const outbox = new OwnerOutbox({ logger });
-  const lane = {
-    session: {
-      running: false,
-      turn: (_input: MainTurnInput) => Promise.resolve({ kind: "reply", text: "approval admitted" } as const),
-      steer: () => Promise.resolve({ kind: "not_admitted", reason: "idle" } as const),
-    } as unknown as MainSession,
-  };
-  const ingress = new OwnerTurnIngress({
-    store,
-    logger,
-    hub,
-    outbox,
-    lanes: () => lane,
-    transcript: () => [],
-  });
-  return { store, tool, ingress };
+  return { store, tool };
 }
 
 async function invoke(tool: CustomTool, callId: string, params: Record<string, unknown>) {
   return await tool.execute(callId, params as never, undefined, {} as never);
 }
 
-function ownerRequest(turnId: string, text: string): OwnerTurnRequest {
-  return {
-    source: "panel",
-    turnId,
-    text,
-    promptText: `${text}\n\n${PANEL_SOURCE_MARKER}`,
-  };
-}
 
 function actionFrom(result: ToolResult, store: StateStore): ActionRecord {
   const id = (result.details?.action as { readonly id?: unknown } | undefined)?.id;
@@ -193,7 +161,7 @@ function isJsonValue(value: unknown): value is JsonValue {
 }
 
 describe("novel service discovery through the generic managed HTTP tool", () => {
-  test("discovers an unfamiliar hypermedia contract, preserves the host origin boundary, then approves and verifies it", async () => {
+  test("discovers an unfamiliar hypermedia contract, preserves the host origin boundary, then executes and verifies it", async () => {
     const service = await serviceFixture();
     const untrustedOrigin = await serviceFixture();
     const harness = createHarness(service);
@@ -326,18 +294,8 @@ describe("novel service discovery through the generic managed HTTP tool", () => 
         },
       });
       const action = actionFrom(proposed, harness.store);
-      expect(action).toMatchObject({ state: "approval_pending", effectClass: "external_mutation" });
+      expect(action).toMatchObject({ state: "planned", effectClass: "external_mutation" });
       expect(service.requestCount("PATCH", mutationPath)).toBe(0);
-
-      const command = `/approve ${action.id} ${action.revision} ${action.digest}`;
-      expect(await harness.ingress.admit(ownerRequest("approve-novel-service", command))).toBe("started");
-      expect(harness.store.assistantWork.getAction(action.id)).toMatchObject({ state: "authorized" });
-      expect(harness.store.assistantWork.listExplicitApprovals(action.id)).toMatchObject([{
-        actionRevision: action.revision,
-        actionDigest: action.digest,
-        state: "active",
-        provenance: { principal: "owner", channel: "owner_panel" },
-      }]);
 
       const executed = await invoke(harness.tool, "execute-discovered-transition", {
         operation: "execute",
@@ -349,7 +307,7 @@ describe("novel service discovery through the generic managed HTTP tool", () => 
         details: {
           kind: "confirmed",
           action: { id: action.id, state: "confirmed", effectClass: "external_mutation" },
-          attempt: { state: "confirmed", authorizationSource: "owner_explicit" },
+          attempt: { state: "confirmed" },
           evidence: {
             kind: "managed_http_verification",
             code: "http_effect_verified",
@@ -371,7 +329,7 @@ describe("novel service discovery through the generic managed HTTP tool", () => 
       });
 
       const attempt = harness.store.assistantWork.listAttempts(action.id)[0];
-      expect(attempt).toMatchObject({ state: "confirmed", authorizationSource: "owner_explicit" });
+      expect(attempt).toMatchObject({ state: "confirmed" });
       expect(attempt?.outcome).toMatchObject({
         kind: "managed_http_verification",
         code: "http_effect_verified",

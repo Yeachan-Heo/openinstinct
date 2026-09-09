@@ -2,13 +2,10 @@ import type { Database } from "bun:sqlite";
 
 import {
   actionMaterialDigest,
-  authorizationRequirementForEffect,
+  isActionState,
   canonicalJson,
-  ownerRuleCanAuthorize,
   stableActionId,
-  stableExplicitApprovalId,
   stableObservationId,
-  stableOwnerRuleId,
   stableRecontactId,
   stableWorkId,
   followupSemanticKey,
@@ -17,6 +14,7 @@ import {
 import type {
   ActionMaterial,
   ActionRecord,
+  ActionListResult,
   ActionState,
   AdmitObservationInput,
   AdmitRecontactInput,
@@ -25,16 +23,12 @@ import type {
   AttemptState,
   AttemptTransitionInput,
   AttemptTransitionRecord,
-  AuthorizationSource,
   ClaimForDispatchInput,
   ClaimForDispatchResult,
   ClaimRejectionReason,
   ClaimNotificationRouteResult,
   EffectClass,
   EvidenceProvenance,
-  ExplicitApprovalRecord,
-  ExplicitApprovalState,
-  GrantExplicitApprovalInput,
   AdmitNotificationInput,
   ClaimDueFollowupResult,
   CompleteFollowupInput,
@@ -53,21 +47,15 @@ import type {
   NotificationRouteState,
   NotificationRouteTransition,
   NotificationWithRoutes,
-  OwnerRuleMatcher,
-  OwnerRuleRecord,
-  OwnerRuleState,
   ProposeActionInput,
   ReserveNotificationRouteResult,
   RecontactRecord,
-  SetOwnerRuleInput,
   SettleNotificationRouteInput,
   SettleAttemptInput,
   WorkRecord,
   WorkState,
 } from "../assistant-work/model.ts";
 
-const LOCAL_POLICY_ID = "assistant-work:local-policy";
-const LOCAL_POLICY_REVISION = 1;
 
 interface WorkRow {
   readonly id: string;
@@ -98,7 +86,7 @@ interface ActionRow {
   readonly semantic_key: string;
   readonly current_revision: number;
   readonly current_digest: string;
-  readonly state: ActionState;
+  readonly state: string;
   readonly active_attempt_id: string | null;
   readonly cancelled_at: string | null;
   readonly cancel_reason: string | null;
@@ -115,40 +103,6 @@ interface ActionRow {
   readonly blocked_evidence_json: string | null;
 }
 
-interface OwnerRuleRow {
-  readonly id: string;
-  readonly revision: number;
-  readonly state: OwnerRuleState;
-  readonly effect_class: EffectClass;
-  readonly recipient: string;
-  readonly topic: string;
-  readonly action_key: string;
-  readonly provenance_principal: EvidenceProvenance["principal"];
-  readonly provenance_channel: string;
-  readonly provenance_subject: string;
-  readonly provenance_evidence_id: string;
-  readonly created_at: string;
-  readonly updated_at: string;
-  readonly revoked_at: string | null;
-}
-
-interface ExplicitApprovalRow {
-  readonly id: string;
-  readonly action_id: string;
-  readonly action_revision: number;
-  readonly action_digest: string;
-  readonly state: ExplicitApprovalState;
-  readonly provenance_principal: EvidenceProvenance["principal"];
-  readonly provenance_channel: string;
-  readonly provenance_subject: string;
-  readonly provenance_evidence_id: string;
-  readonly created_at: string;
-  readonly updated_at: string;
-  readonly consumed_at: string | null;
-  readonly consumed_attempt_id: string | null;
-  readonly invalidated_at: string | null;
-  readonly revoked_at: string | null;
-}
 
 interface AttemptRow {
   readonly id: string;
@@ -158,9 +112,6 @@ interface AttemptRow {
   readonly sequence: number;
   readonly state: AttemptState;
   readonly worker_id: string;
-  readonly authorization_source: AuthorizationSource;
-  readonly authorization_id: string | null;
-  readonly authorization_revision: number | null;
   readonly claimed_at: string;
   readonly effect_started_at: string | null;
   readonly settled_at: string | null;
@@ -244,12 +195,6 @@ interface CountRow {
   readonly count: number;
 }
 
-interface AuthorizationDecision {
-  readonly source: AuthorizationSource;
-  readonly id?: string;
-  readonly revision?: number;
-  readonly approval?: ExplicitApprovalRecord;
-}
 
 export interface FollowupReportInput {
   readonly id: string;
@@ -299,21 +244,10 @@ const ACTION_COLUMNS = `
   revisions.cost_json, revisions.deadline_at, revisions.blocked_evidence_json
 `;
 
-const OWNER_RULE_COLUMNS = `
-  id, revision, state, effect_class, recipient, topic, action_key,
-  provenance_principal, provenance_channel, provenance_subject, provenance_evidence_id,
-  created_at, updated_at, revoked_at
-`;
-
-const EXPLICIT_APPROVAL_COLUMNS = `
-  id, action_id, action_revision, action_digest, state,
-  provenance_principal, provenance_channel, provenance_subject, provenance_evidence_id,
-  created_at, updated_at, consumed_at, consumed_attempt_id, invalidated_at, revoked_at
-`;
 
 const ATTEMPT_COLUMNS = `
   id, action_id, action_revision, action_digest, sequence, state, worker_id,
-  authorization_source, authorization_id, authorization_revision, claimed_at,
+  claimed_at,
   effect_started_at, settled_at, outcome_json, recovered_at, recovery_count, updated_at
 `;
 
@@ -352,23 +286,13 @@ export interface AssistantWorkRepository {
 
   proposeAction(input: ProposeActionInput, now: string): ActionRecord;
   getAction(id: string): ActionRecord | undefined;
-  listActions(workId?: string): ActionRecord[];
+  listActions(workId?: string): ActionListResult;
   cancelAction(
     input: { readonly actionId: string; readonly revision: number; readonly digest: string; readonly reason: string },
     now: string,
   ): ActionRecord;
 
-  setOwnerRule(input: SetOwnerRuleInput, now: string): OwnerRuleRecord;
-  getOwnerRule(id: string): OwnerRuleRecord | undefined;
-  listOwnerRules(state?: OwnerRuleState): OwnerRuleRecord[];
-  revokeOwnerRule(id: string, expectedRevision: number, provenance: EvidenceProvenance, now: string): OwnerRuleRecord;
-
-  grantExplicitApproval(input: GrantExplicitApprovalInput, now: string): ExplicitApprovalRecord;
-  getExplicitApproval(id: string): ExplicitApprovalRecord | undefined;
-  listExplicitApprovals(actionId?: string): ExplicitApprovalRecord[];
-  revokeExplicitApproval(id: string, provenance: EvidenceProvenance, now: string): ExplicitApprovalRecord;
-
-  /** Atomically rechecks current revision/policy/cancel/deadline, consumes approval, and inserts the pre-effect attempt. */
+  /** Atomically rechecks revision, cancellation and deadline before inserting the pre-effect attempt. */
   claimForDispatch(input: ClaimForDispatchInput, now: string): ClaimForDispatchResult;
   /** Persist this transition and wait for its return before invoking any external effect. */
   markEffectStarted(input: AttemptTransitionInput, now: string): AttemptTransitionRecord;
@@ -614,11 +538,6 @@ class SqliteAssistantWorkRepository implements AssistantWorkRepository {
              cancelled_at = NULL, cancel_reason = NULL, updated_at = ?
          WHERE id = ? AND current_revision = ? AND current_digest = ?`,
       ).run(revision, digest, initialActionState(input.effectClass), now, actionId, existing.revision, existing.digest);
-      this.db.query(
-        `UPDATE assistant_work_explicit_approvals
-         SET state = 'invalidated', invalidated_at = ?, updated_at = ?
-         WHERE action_id = ? AND state = 'active'`,
-      ).run(now, now, actionId);
       return this.getRequiredAction(actionId);
     });
   }
@@ -635,18 +554,28 @@ class SqliteAssistantWorkRepository implements AssistantWorkRepository {
     return row === null ? undefined : toActionRecord(row);
   }
 
-  public listActions(workId?: string): ActionRecord[] {
+  public listActions(workId?: string): ActionListResult {
     if (workId !== undefined) {
       assertNonEmpty(workId, "action workId");
     }
     const clause = workId === undefined ? "" : " WHERE actions.work_id = ?";
-    return (this.db.query(
+    const rows = this.db.query(
       `SELECT ${ACTION_COLUMNS}
        FROM assistant_work_actions AS actions
        JOIN assistant_work_action_revisions AS revisions
          ON revisions.action_id = actions.id AND revisions.revision = actions.current_revision
        ${clause} ORDER BY actions.created_at, actions.ROWID`,
-    ).all(...(workId === undefined ? [] : [workId])) as ActionRow[]).map(toActionRecord);
+    ).all(...(workId === undefined ? [] : [workId])) as ActionRow[];
+    const result: ActionListResult = { actions: [], unsupported: [] };
+    for (const row of rows) {
+      if (!isActionState(row.state)) {
+        result.unsupported.push({ kind: "unsupported_action_state", actionId: row.id,
+          workId: row.work_id, state: row.state, revision: row.current_revision, digest: row.current_digest });
+      } else {
+        result.actions.push(toActionRecord(row));
+      }
+    }
+    return result;
   }
 
   public cancelAction(
@@ -681,220 +610,10 @@ class SqliteAssistantWorkRepository implements AssistantWorkRepository {
          SET state = 'cancelled', cancelled_at = ?, cancel_reason = ?, updated_at = ?
          WHERE id = ? AND current_revision = ? AND current_digest = ?`,
       ).run(now, input.reason, now, action.id, action.revision, action.digest);
-      this.db.query(
-        `UPDATE assistant_work_explicit_approvals
-         SET state = 'invalidated', invalidated_at = ?, updated_at = ?
-         WHERE action_id = ? AND state = 'active'`,
-      ).run(now, now, action.id);
       return this.getRequiredAction(action.id);
     });
   }
 
-  public setOwnerRule(input: SetOwnerRuleInput, now: string): OwnerRuleRecord {
-    assertOwnerRuleInput(input);
-    assertTimestamp(now, "owner rule now");
-    const id = stableOwnerRuleId(input.matcher);
-
-    return this.transaction("setOwnerRule", () => {
-      const existing = this.getOwnerRule(id);
-      if (!existing) {
-        this.db.query(
-          `INSERT INTO assistant_work_owner_rules (
-            id, revision, state, effect_class, recipient, topic, action_key,
-            provenance_principal, provenance_channel, provenance_subject, provenance_evidence_id,
-            created_at, updated_at
-          ) VALUES (?, 1, 'enabled', ?, ?, ?, ?, 'owner', ?, ?, ?, ?, ?)`,
-        ).run(
-          id,
-          input.matcher.effectClass,
-          input.matcher.recipient,
-          input.matcher.topic,
-          input.matcher.action,
-          input.provenance.channel,
-          input.provenance.subject,
-          input.provenance.evidenceId,
-          now,
-          now,
-        );
-        return this.getRequiredOwnerRule(id);
-      }
-
-      assertSameRuleMatcher(existing.matcher, input.matcher);
-      if (existing.state === "enabled") {
-        return existing;
-      }
-      this.db.query(
-        `UPDATE assistant_work_owner_rules
-         SET revision = revision + 1, state = 'enabled',
-             provenance_principal = 'owner', provenance_channel = ?, provenance_subject = ?,
-             provenance_evidence_id = ?, revoked_at = NULL, updated_at = ?
-         WHERE id = ? AND revision = ? AND state = 'revoked'`,
-      ).run(
-        input.provenance.channel,
-        input.provenance.subject,
-        input.provenance.evidenceId,
-        now,
-        id,
-        existing.revision,
-      );
-      return this.getRequiredOwnerRule(id);
-    });
-  }
-
-  public getOwnerRule(id: string): OwnerRuleRecord | undefined {
-    assertNonEmpty(id, "owner rule id");
-    const row = this.db.query(
-      `SELECT ${OWNER_RULE_COLUMNS} FROM assistant_work_owner_rules WHERE id = ?`,
-    ).get(id) as OwnerRuleRow | null;
-    return row === null ? undefined : toOwnerRuleRecord(row);
-  }
-
-  public listOwnerRules(state?: OwnerRuleState): OwnerRuleRecord[] {
-    if (state !== undefined && state !== "enabled" && state !== "revoked") {
-      throw new Error("owner rule state is invalid");
-    }
-    const clause = state === undefined ? "" : " WHERE state = ?";
-    return (this.db.query(
-      `SELECT ${OWNER_RULE_COLUMNS} FROM assistant_work_owner_rules${clause} ORDER BY created_at, ROWID`,
-    ).all(...(state === undefined ? [] : [state])) as OwnerRuleRow[]).map(toOwnerRuleRecord);
-  }
-
-  public revokeOwnerRule(
-    id: string,
-    expectedRevision: number,
-    provenance: EvidenceProvenance,
-    now: string,
-  ): OwnerRuleRecord {
-    assertNonEmpty(id, "owner rule id");
-    assertPositiveInteger(expectedRevision, "owner rule revision");
-    assertOwnerProvenance(provenance);
-    assertTimestamp(now, "owner rule revocation now");
-
-    return this.transaction("revokeOwnerRule", () => {
-      const rule = this.getRequiredOwnerRule(id);
-      if (rule.revision !== expectedRevision) {
-        throw new Error(`stale owner rule revision: expected ${expectedRevision}, current ${rule.revision}`);
-      }
-      if (rule.state === "revoked") {
-        return rule;
-      }
-      this.db.query(
-        `UPDATE assistant_work_owner_rules
-         SET revision = revision + 1, state = 'revoked', revoked_at = ?, updated_at = ?
-         WHERE id = ? AND revision = ? AND state = 'enabled'`,
-      ).run(now, now, id, expectedRevision);
-      return this.getRequiredOwnerRule(id);
-    });
-  }
-
-  public grantExplicitApproval(input: GrantExplicitApprovalInput, now: string): ExplicitApprovalRecord {
-    assertNonEmpty(input.actionId, "approval actionId");
-    assertPositiveInteger(input.revision, "approval action revision");
-    assertDigest(input.digest, "approval action digest");
-    assertOwnerProvenance(input.provenance);
-    assertTimestamp(now, "explicit approval now");
-    const id = stableExplicitApprovalId(
-      input.actionId,
-      input.revision,
-      input.digest,
-      input.provenance.evidenceId,
-    );
-
-    return this.transaction("grantExplicitApproval", () => {
-      const action = this.getRequiredAction(input.actionId);
-      assertCurrentAction(action, input.revision, input.digest);
-      if (!canApproveAction(action.state)) {
-        throw new Error(`assistant action cannot be approved from ${action.state}: ${action.id}`);
-      }
-      if (authorizationRequirementForEffect(action.effectClass) === "blocked") {
-        throw new Error(`uncovered assistant action cannot be approved: ${action.id}`);
-      }
-      if (authorizationRequirementForEffect(action.effectClass) === "local_policy") {
-        throw new Error(`assistant action already uses local policy: ${action.id}`);
-      }
-
-      const existing = this.getExplicitApproval(id);
-      if (existing) {
-        assertApprovalReplay(existing, input);
-        return existing;
-      }
-      this.db.query(
-        `INSERT INTO assistant_work_explicit_approvals (
-          id, action_id, action_revision, action_digest, state,
-          provenance_principal, provenance_channel, provenance_subject, provenance_evidence_id,
-          created_at, updated_at
-        ) VALUES (?, ?, ?, ?, 'active', 'owner', ?, ?, ?, ?, ?)`,
-      ).run(
-        id,
-        input.actionId,
-        input.revision,
-        input.digest,
-        input.provenance.channel,
-        input.provenance.subject,
-        input.provenance.evidenceId,
-        now,
-        now,
-      );
-      this.db.query(
-        `UPDATE assistant_work_actions SET state = 'authorized', updated_at = ?
-         WHERE id = ? AND current_revision = ? AND current_digest = ?
-           AND state IN ('planned', 'approval_pending', 'authorized')`,
-      ).run(now, input.actionId, input.revision, input.digest);
-      return this.getRequiredExplicitApproval(id);
-    });
-  }
-
-  public getExplicitApproval(id: string): ExplicitApprovalRecord | undefined {
-    assertNonEmpty(id, "explicit approval id");
-    const row = this.db.query(
-      `SELECT ${EXPLICIT_APPROVAL_COLUMNS} FROM assistant_work_explicit_approvals WHERE id = ?`,
-    ).get(id) as ExplicitApprovalRow | null;
-    return row === null ? undefined : toExplicitApprovalRecord(row);
-  }
-
-  public listExplicitApprovals(actionId?: string): ExplicitApprovalRecord[] {
-    if (actionId !== undefined) {
-      assertNonEmpty(actionId, "approval actionId");
-    }
-    const clause = actionId === undefined ? "" : " WHERE action_id = ?";
-    return (this.db.query(
-      `SELECT ${EXPLICIT_APPROVAL_COLUMNS}
-       FROM assistant_work_explicit_approvals${clause} ORDER BY created_at, ROWID`,
-    ).all(...(actionId === undefined ? [] : [actionId])) as ExplicitApprovalRow[]).map(toExplicitApprovalRecord);
-  }
-
-  public revokeExplicitApproval(
-    id: string,
-    provenance: EvidenceProvenance,
-    now: string,
-  ): ExplicitApprovalRecord {
-    assertNonEmpty(id, "explicit approval id");
-    assertOwnerProvenance(provenance);
-    assertTimestamp(now, "explicit approval revocation now");
-
-    return this.transaction("revokeExplicitApproval", () => {
-      const approval = this.getRequiredExplicitApproval(id);
-      if (approval.state === "revoked") {
-        return approval;
-      }
-      if (approval.state !== "active") {
-        throw new Error(`explicit approval cannot be revoked from ${approval.state}: ${id}`);
-      }
-      this.db.query(
-        `UPDATE assistant_work_explicit_approvals
-         SET state = 'revoked', revoked_at = ?, updated_at = ?
-         WHERE id = ? AND state = 'active'`,
-      ).run(now, now, id);
-      const action = this.getRequiredAction(approval.actionId);
-      if (action.state === "authorized") {
-        this.db.query(
-          `UPDATE assistant_work_actions SET state = 'approval_pending', updated_at = ?
-           WHERE id = ? AND current_revision = ? AND current_digest = ? AND state = 'authorized'`,
-        ).run(now, action.id, action.revision, action.digest);
-      }
-      return this.getRequiredExplicitApproval(id);
-    });
-  }
 
   public claimForDispatch(input: ClaimForDispatchInput, now: string): ClaimForDispatchResult {
     assertClaimInput(input);
@@ -911,6 +630,12 @@ class SqliteAssistantWorkRepository implements AssistantWorkRepository {
           && action.digest === input.digest
           && action.activeAttemptId === priorAttempt.id
         ) {
+          if (this.getRequiredWork(action.workId).state !== "open") {
+            return rejectedClaim("terminal", action, priorAttempt);
+          }
+          if (action.deadlineAt !== undefined && Date.parse(action.deadlineAt) <= Date.parse(now)) {
+            return rejectedClaim("expired", action, priorAttempt);
+          }
           return { kind: "claimed", resumed: true, action, attempt: priorAttempt };
         }
         return rejectedClaim(rejectionForAttempt(priorAttempt.state), action, priorAttempt);
@@ -926,6 +651,9 @@ class SqliteAssistantWorkRepository implements AssistantWorkRepository {
       if (action.digest !== input.digest) {
         return rejectedClaim("stale_digest", action);
       }
+      if (this.getRequiredWork(action.workId).state !== "open") {
+        return rejectedClaim("terminal", action);
+      }
 
       const stateRejection = rejectionForAction(action.state);
       if (stateRejection !== undefined) {
@@ -935,24 +663,14 @@ class SqliteAssistantWorkRepository implements AssistantWorkRepository {
         this.db.query(
           `UPDATE assistant_work_actions SET state = 'expired', updated_at = ?
            WHERE id = ? AND current_revision = ? AND current_digest = ?
-             AND state IN ('planned', 'approval_pending', 'authorized')`,
+             AND state = 'planned'`,
         ).run(now, action.id, action.revision, action.digest);
-        this.invalidateActiveApprovals(action.id, now);
         return rejectedClaim("expired", this.getRequiredAction(action.id));
       }
       if (action.activeAttemptId !== undefined) {
         return rejectedClaim("already_claimed", action, this.getActiveAttempt(action));
       }
 
-      const authorization = this.resolveAuthorization(action);
-      if (!authorization) {
-        this.db.query(
-          `UPDATE assistant_work_actions SET state = 'approval_pending', updated_at = ?
-           WHERE id = ? AND current_revision = ? AND current_digest = ?
-             AND state IN ('planned', 'approval_pending', 'authorized')`,
-        ).run(now, action.id, action.revision, action.digest);
-        return rejectedClaim("approval_required", this.getRequiredAction(action.id));
-      }
 
       const sequence = (this.db.query(
         "SELECT count(*) AS count FROM assistant_work_attempts WHERE action_id = ? AND action_revision = ?",
@@ -970,9 +688,10 @@ class SqliteAssistantWorkRepository implements AssistantWorkRepository {
         action.digest,
         sequence,
         input.workerId,
-        authorization.source,
-        authorization.id ?? null,
-        authorization.revision ?? null,
+        // Immutable historical schema requires this value; it carries no authority.
+        "local_policy",
+        null,
+        null,
         now,
         now,
       );
@@ -982,31 +701,12 @@ class SqliteAssistantWorkRepository implements AssistantWorkRepository {
          SET state = 'claimed_pre_effect', active_attempt_id = ?, updated_at = ?
          WHERE id = ? AND current_revision = ? AND current_digest = ?
            AND active_attempt_id IS NULL AND cancelled_at IS NULL
-           AND state IN ('planned', 'approval_pending', 'authorized')`,
+           AND state = 'planned'`,
       ).run(input.attemptId, now, action.id, action.revision, action.digest);
       if (claimed.changes !== 1) {
         throw new Error(`assistant action claim lost its compare-and-swap: ${action.id}`);
       }
 
-      if (authorization.approval !== undefined) {
-        const consumed = this.db.query(
-          `UPDATE assistant_work_explicit_approvals
-           SET state = 'consumed', consumed_at = ?, consumed_attempt_id = ?, updated_at = ?
-           WHERE id = ? AND state = 'active'
-             AND action_id = ? AND action_revision = ? AND action_digest = ?`,
-        ).run(
-          now,
-          input.attemptId,
-          now,
-          authorization.approval.id,
-          action.id,
-          action.revision,
-          action.digest,
-        );
-        if (consumed.changes !== 1) {
-          throw new Error(`explicit approval was not atomically consumed: ${authorization.approval.id}`);
-        }
-      }
 
       return {
         kind: "claimed",
@@ -1031,6 +731,12 @@ class SqliteAssistantWorkRepository implements AssistantWorkRepository {
       }
       const action = this.getRequiredAction(attempt.actionId);
       assertAttemptOwnsCurrentAction(attempt, action, "claimed_pre_effect");
+      if (this.getRequiredWork(action.workId).state !== "open") {
+        throw new Error(`cannot start effect for terminal work: ${action.workId}`);
+      }
+      if (action.deadlineAt !== undefined && Date.parse(action.deadlineAt) <= Date.parse(now)) {
+        throw new Error(`cannot start effect after action deadline: ${action.id}`);
+      }
 
       const attemptUpdate = this.db.query(
         `UPDATE assistant_work_attempts
@@ -1125,22 +831,12 @@ class SqliteAssistantWorkRepository implements AssistantWorkRepository {
       const action = this.getRequiredAction(attempt.actionId);
       if (attempt.state === "claimed_pre_effect") {
         assertAttemptOwnsCurrentAction(attempt, action, "claimed_pre_effect");
-        if (action.deadlineAt !== undefined && Date.parse(action.deadlineAt) <= Date.parse(now)) {
-          const transition = this.cancelPreEffectRecovery(attempt, action, "expired", "deadline_expired", now);
-          this.invalidateActiveApprovals(action.id, now);
+        if (this.getRequiredWork(action.workId).state !== "open") {
+          const transition = this.cancelPreEffectRecovery(attempt, action, "cancelled", "work_terminal", now);
           return { kind: "terminal_no_replay", ...transition };
         }
-        if (!this.isRecoveryAuthorizationCurrent(action, attempt)) {
-          const nextState = authorizationRequirementForEffect(action.effectClass) === "local_policy"
-            ? "blocked"
-            : initialActionState(action.effectClass);
-          const transition = this.cancelPreEffectRecovery(
-            attempt,
-            action,
-            nextState,
-            "authorization_no_longer_current",
-            now,
-          );
+        if (action.deadlineAt !== undefined && Date.parse(action.deadlineAt) <= Date.parse(now)) {
+          const transition = this.cancelPreEffectRecovery(attempt, action, "expired", "deadline_expired", now);
           return { kind: "terminal_no_replay", ...transition };
         }
         this.db.query(
@@ -1364,7 +1060,7 @@ class SqliteAssistantWorkRepository implements AssistantWorkRepository {
         this.clearFollowupDue(policy, now);
         return { kind: "none", reason: "policy_changed", policy, action: originalAction };
       }
-      if (originalAction.state === "planned" || originalAction.state === "approval_pending" || originalAction.state === "authorized") {
+      if (originalAction.state === "planned") {
         return { kind: "none", reason: "source_unconfirmed", policy, action: originalAction };
       }
       if (originalAction.deadlineAt !== undefined && Date.parse(originalAction.deadlineAt) <= Date.parse(now)) {
@@ -1400,7 +1096,7 @@ class SqliteAssistantWorkRepository implements AssistantWorkRepository {
           this.db.query(
             `UPDATE assistant_work_actions SET state = 'expired', updated_at = ?
              WHERE id = ? AND current_revision = ? AND current_digest = ?
-               AND state IN ('planned', 'approval_pending', 'authorized')`,
+               AND state = 'planned'`,
           ).run(now, action.id, action.revision, action.digest);
           this.db.query(
             `UPDATE assistant_work_followup_dispatches
@@ -1438,9 +1134,6 @@ class SqliteAssistantWorkRepository implements AssistantWorkRepository {
             originalAction,
             action,
           };
-        }
-        if (!this.resolveAuthorization(action)) {
-          return { kind: "none", reason: "approval_required", policy, dispatch: existingDispatch, action };
         }
         this.db.query(
           `UPDATE assistant_work_followup_dispatches
@@ -1485,16 +1178,6 @@ class SqliteAssistantWorkRepository implements AssistantWorkRepository {
         now,
         now,
       );
-      const authorization = this.resolveAuthorization(action);
-      if (!authorization) {
-        return {
-          kind: "none",
-          reason: "approval_required",
-          policy,
-          dispatch: this.getRequiredFollowupDispatch(dispatchId),
-          action,
-        };
-      }
       this.db.query(
         `UPDATE assistant_work_followup_dispatches
          SET state = 'claimed', worker_id = ?, claimed_at = ?, updated_at = ?
@@ -1602,25 +1285,6 @@ class SqliteAssistantWorkRepository implements AssistantWorkRepository {
           .run(now, canonicalJson({ kind: "rejected", detail: { reason: obsoleteReason } }), now, dispatch.id);
         return { kind: "none", reason: obsoleteReason, policy, dispatch: this.getRequiredFollowupDispatch(dispatch.id), action };
       }
-      if (!this.resolveAuthorization(action)) {
-        this.db.query(
-          `UPDATE assistant_work_followup_dispatches
-           SET state = 'due', worker_id = NULL, claimed_at = NULL,
-               outcome_json = ?, updated_at = ?
-           WHERE id = ? AND state = 'claimed'`,
-        ).run(
-          canonicalJson({ kind: "approval_required", detail: { reason: "current_authorization_missing" } }),
-          now,
-          dispatch.id,
-        );
-        return {
-          kind: "none",
-          reason: "approval_required",
-          policy,
-          dispatch: this.getRequiredFollowupDispatch(dispatch.id),
-          action,
-        };
-      }
       return {
         kind: "claimed",
         policy,
@@ -1680,19 +1344,6 @@ class SqliteAssistantWorkRepository implements AssistantWorkRepository {
       }
       const policy = this.getRequiredFollowupPolicy(dispatch.workId);
       const policyCurrent = policy.revision === dispatch.policyRevision;
-      if (policyCurrent && input.outcome.kind === "approval_required") {
-        this.db.query(
-          `UPDATE assistant_work_followup_dispatches
-           SET state = 'due', worker_id = NULL, claimed_at = NULL, completed_at = NULL,
-               outcome_json = ?, updated_at = ?
-           WHERE id = ? AND state = 'claimed' AND worker_id = ?`,
-        ).run(canonicalJson(followupOutcomeToJson(input.outcome)), now, dispatch.id, input.workerId);
-        this.insertFollowupReport(report, now);
-        return {
-          policy,
-          dispatch: this.getRequiredFollowupDispatch(dispatch.id),
-        };
-      }
       const stopsPolicy = input.outcome.kind === "ambiguous" || input.outcome.kind === "rejected";
       const nextOrdinal = dispatch.ordinal + 1;
       const canSchedule = policyCurrent
@@ -2146,77 +1797,6 @@ class SqliteAssistantWorkRepository implements AssistantWorkRepository {
     );
   }
 
-  private resolveAuthorization(action: ActionRecord): AuthorizationDecision | undefined {
-    const approvalRow = this.db.query(
-      `SELECT ${EXPLICIT_APPROVAL_COLUMNS}
-       FROM assistant_work_explicit_approvals
-       WHERE action_id = ? AND action_revision = ? AND action_digest = ? AND state = 'active'
-       ORDER BY created_at, ROWID LIMIT 1`,
-    ).get(action.id, action.revision, action.digest) as ExplicitApprovalRow | null;
-    if (approvalRow !== null) {
-      const approval = toExplicitApprovalRecord(approvalRow);
-      return { source: "owner_explicit", id: approval.id, approval };
-    }
-
-    const requirement = authorizationRequirementForEffect(action.effectClass);
-    if (requirement === "local_policy") {
-      return { source: "local_policy", id: LOCAL_POLICY_ID, revision: LOCAL_POLICY_REVISION };
-    }
-    if (
-      requirement === "owner_rule_or_explicit"
-      && action.recipient !== undefined
-      && action.topic !== undefined
-    ) {
-      const ruleRow = this.db.query(
-        `SELECT ${OWNER_RULE_COLUMNS}
-         FROM assistant_work_owner_rules
-         WHERE state = 'enabled' AND effect_class = ? AND recipient = ? AND topic = ? AND action_key = ?
-         ORDER BY updated_at DESC, ROWID DESC LIMIT 1`,
-      ).get(action.effectClass, action.recipient, action.topic, action.action) as OwnerRuleRow | null;
-      if (ruleRow !== null) {
-        const rule = toOwnerRuleRecord(ruleRow);
-        return { source: "owner_rule", id: rule.id, revision: rule.revision };
-      }
-    }
-    return undefined;
-  }
-
-  private isRecoveryAuthorizationCurrent(action: ActionRecord, attempt: AttemptRecord): boolean {
-    switch (attempt.authorizationSource) {
-      case "local_policy":
-        return authorizationRequirementForEffect(action.effectClass) === "local_policy"
-          && attempt.authorizationId === LOCAL_POLICY_ID
-          && attempt.authorizationRevision === LOCAL_POLICY_REVISION;
-      case "owner_explicit": {
-        if (attempt.authorizationId === undefined) {
-          return false;
-        }
-        const approval = this.getExplicitApproval(attempt.authorizationId);
-        return approval?.state === "consumed"
-          && approval.actionId === action.id
-          && approval.actionRevision === action.revision
-          && approval.actionDigest === action.digest
-          && approval.consumedAttemptId === attempt.id;
-      }
-      case "owner_rule": {
-        if (
-          attempt.authorizationId === undefined
-          || attempt.authorizationRevision === undefined
-          || action.recipient === undefined
-          || action.topic === undefined
-        ) {
-          return false;
-        }
-        const rule = this.getOwnerRule(attempt.authorizationId);
-        return rule?.state === "enabled"
-          && rule.revision === attempt.authorizationRevision
-          && rule.matcher.effectClass === action.effectClass
-          && rule.matcher.recipient === action.recipient
-          && rule.matcher.topic === action.topic
-          && rule.matcher.action === action.action;
-      }
-    }
-  }
 
   private cancelPreEffectRecovery(
     attempt: AttemptRecord,
@@ -2340,13 +1920,6 @@ class SqliteAssistantWorkRepository implements AssistantWorkRepository {
     });
   }
 
-  private invalidateActiveApprovals(actionId: string, now: string): void {
-    this.db.query(
-      `UPDATE assistant_work_explicit_approvals
-       SET state = 'invalidated', invalidated_at = ?, updated_at = ?
-       WHERE action_id = ? AND state = 'active'`,
-    ).run(now, now, actionId);
-  }
 
   private insertFollowupReport(input: FollowupReportInput, now: string): void {
     const existing = this.getFollowupReport(input.id);
@@ -2420,21 +1993,6 @@ class SqliteAssistantWorkRepository implements AssistantWorkRepository {
     return record;
   }
 
-  private getRequiredOwnerRule(id: string): OwnerRuleRecord {
-    const record = this.getOwnerRule(id);
-    if (!record) {
-      throw new Error(`unknown assistant owner rule: ${id}`);
-    }
-    return record;
-  }
-
-  private getRequiredExplicitApproval(id: string): ExplicitApprovalRecord {
-    const record = this.getExplicitApproval(id);
-    if (!record) {
-      throw new Error(`unknown assistant explicit approval: ${id}`);
-    }
-    return record;
-  }
 
   private getRequiredAttempt(id: string): AttemptRecord {
     const record = this.getAttempt(id);
@@ -2528,13 +2086,17 @@ function toObservationRecord(row: ObservationRow): ObservationRecord {
 }
 
 function toActionRecord(row: ActionRow): ActionRecord {
+  const state = row.state;
+  if (!isActionState(state)) {
+    throw new Error(`unsupported assistant action state ${state}: action ${row.id}, work ${row.work_id}, revision ${row.current_revision}, digest ${row.current_digest}`);
+  }
   return {
     id: row.id,
     workId: row.work_id,
     semanticKey: row.semantic_key,
     revision: row.current_revision,
     digest: row.current_digest,
-    state: row.state,
+    state,
     effectClass: row.effect_class,
     ...(row.recipient === null ? {} : { recipient: row.recipient }),
     ...(row.topic === null ? {} : { topic: row.topic }),
@@ -2554,40 +2116,6 @@ function toActionRecord(row: ActionRow): ActionRecord {
   };
 }
 
-function toOwnerRuleRecord(row: OwnerRuleRow): OwnerRuleRecord {
-  return {
-    id: row.id,
-    revision: row.revision,
-    state: row.state,
-    matcher: {
-      effectClass: row.effect_class,
-      recipient: row.recipient,
-      topic: row.topic,
-      action: row.action_key,
-    },
-    provenance: provenanceFromRow(row),
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-    ...(row.revoked_at === null ? {} : { revokedAt: row.revoked_at }),
-  };
-}
-
-function toExplicitApprovalRecord(row: ExplicitApprovalRow): ExplicitApprovalRecord {
-  return {
-    id: row.id,
-    actionId: row.action_id,
-    actionRevision: row.action_revision,
-    actionDigest: row.action_digest,
-    state: row.state,
-    provenance: provenanceFromRow(row),
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-    ...(row.consumed_at === null ? {} : { consumedAt: row.consumed_at }),
-    ...(row.consumed_attempt_id === null ? {} : { consumedAttemptId: row.consumed_attempt_id }),
-    ...(row.invalidated_at === null ? {} : { invalidatedAt: row.invalidated_at }),
-    ...(row.revoked_at === null ? {} : { revokedAt: row.revoked_at }),
-  };
-}
 
 function toAttemptRecord(row: AttemptRow): AttemptRecord {
   return {
@@ -2598,9 +2126,6 @@ function toAttemptRecord(row: AttemptRow): AttemptRecord {
     sequence: row.sequence,
     state: row.state,
     workerId: row.worker_id,
-    authorizationSource: row.authorization_source,
-    ...(row.authorization_id === null ? {} : { authorizationId: row.authorization_id }),
-    ...(row.authorization_revision === null ? {} : { authorizationRevision: row.authorization_revision }),
     claimedAt: row.claimed_at,
     ...(row.effect_started_at === null ? {} : { effectStartedAt: row.effect_started_at }),
     ...(row.settled_at === null ? {} : { settledAt: row.settled_at }),
@@ -2723,42 +2248,25 @@ function followupOutcomeToJson(outcome: FollowupDispatchOutcome): JsonValue {
 }
 
 function initialActionState(effectClass: EffectClass): ActionState {
-  switch (authorizationRequirementForEffect(effectClass)) {
-    case "local_policy":
-      return "authorized";
-    case "owner_explicit":
-    case "owner_rule_or_explicit":
-      return "approval_pending";
-    case "blocked":
-      return "blocked";
-  }
+  return effectClass === "uncovered" ? "blocked" : "planned";
 }
 
 function canReviseAction(state: ActionState): boolean {
   return state === "planned"
-    || state === "approval_pending"
-    || state === "authorized"
     || state === "definitive_failed"
     || state === "blocked";
 }
 
 function canCancelAction(state: ActionState): boolean {
   return state === "planned"
-    || state === "approval_pending"
-    || state === "authorized"
     || state === "claimed_pre_effect"
     || state === "blocked";
 }
 
-function canApproveAction(state: ActionState): boolean {
-  return state === "planned" || state === "approval_pending" || state === "authorized";
-}
 
 function rejectionForAction(state: ActionState): ClaimRejectionReason | undefined {
   switch (state) {
     case "planned":
-    case "approval_pending":
-    case "authorized":
       return undefined;
     case "blocked":
       return "blocked";
@@ -2846,7 +2354,6 @@ function assertCompleteFollowupInput(input: CompleteFollowupInput): void {
   assertNonEmpty(input.workerId, "followup completion workerId");
   if (
     input.outcome.kind !== "confirmed"
-    && input.outcome.kind !== "approval_required"
     && input.outcome.kind !== "definitive_failed"
     && input.outcome.kind !== "ambiguous"
     && input.outcome.kind !== "rejected"
@@ -2956,42 +2463,6 @@ function assertActionProposal(input: ProposeActionInput): void {
   }
 }
 
-function assertOwnerRuleInput(input: SetOwnerRuleInput): void {
-  assertOwnerProvenance(input.provenance);
-  assertRuleMatcher(input.matcher);
-}
-
-function assertRuleMatcher(matcher: OwnerRuleMatcher): void {
-  assertEffectClass(matcher.effectClass);
-  if (!ownerRuleCanAuthorize(matcher.effectClass)) {
-    throw new Error(`owner rules cannot authorize effect class ${matcher.effectClass}`);
-  }
-  assertNonEmpty(matcher.recipient, "owner rule recipient");
-  assertNonEmpty(matcher.topic, "owner rule topic");
-  assertNonEmpty(matcher.action, "owner rule action");
-}
-
-function assertSameRuleMatcher(actual: OwnerRuleMatcher, expected: OwnerRuleMatcher): void {
-  if (
-    actual.effectClass !== expected.effectClass
-    || actual.recipient !== expected.recipient
-    || actual.topic !== expected.topic
-    || actual.action !== expected.action
-  ) {
-    throw new Error("owner rule identity collision");
-  }
-}
-
-function assertApprovalReplay(record: ExplicitApprovalRecord, input: GrantExplicitApprovalInput): void {
-  if (
-    record.actionId !== input.actionId
-    || record.actionRevision !== input.revision
-    || record.actionDigest !== input.digest
-    || !sameProvenance(record.provenance, input.provenance)
-  ) {
-    throw new Error(`explicit approval identity collision: ${record.id}`);
-  }
-}
 
 function assertClaimInput(input: ClaimForDispatchInput): void {
   assertNonEmpty(input.actionId, "claim actionId");
@@ -3050,7 +2521,7 @@ function assertCurrentAction(action: ActionRecord, revision: number, digest: str
 function assertOwnerProvenance(provenance: EvidenceProvenance): void {
   assertProvenance(provenance);
   if (provenance.principal !== "owner") {
-    throw new Error(`${provenance.principal} evidence cannot create owner authorization`);
+    throw new Error(`${provenance.principal} evidence cannot configure owner followups`);
   }
 }
 
